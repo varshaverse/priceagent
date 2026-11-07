@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+.DS_Store
+data/receipts.json
+data/google-oauth-tokens.json
+data/google-oauth-tokens.json.*.tmp
+data/uploads/*
+!data/uploads/.gitkeep

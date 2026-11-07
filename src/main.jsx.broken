@@ -1,0 +1,119 @@
+  }, [product.purchaseDate, product.date]);
+  const history = (product.priceHistory || []).filter(snapshot => snapshot.verified !== false);
+  const notifications = product.notificationHistory || [];
+  const alternativeOffers = (product.alternativeOffers || [])
+    .filter(offer => offer.verified === true)
+    .sort((left, right) => Number(left.price) - Number(right.price));
+  const status = product.monitoringStatus || 'URL DISCOVERY';
+  const verifiedCurrentPrice = product.originalUrlVerified === true &&
+    product.currentVerifiedPrice != null &&
+    Number.isFinite(Number(product.currentVerifiedPrice))
+    ? Number(product.currentVerifiedPrice)
+    : null;
+  const validDrop = status === 'PRICE DROP DETECTED' &&
+    verifiedCurrentPrice != null &&
+    verifiedCurrentPrice < Number(product.purchasePrice) &&
+    Boolean(product.lastCheckedAt);
+  const statusClass = validDrop
+    ? 'drop'
+    : status === 'PRICE UNAVAILABLE' ||
+      status === 'NEEDS CONFIRMATION' ||
+      status === 'PURCHASE DATE NEEDS CONFIRMATION'
+      ? 'unavailable'
+      : status === 'WATCH EXPIRED'
+        ? 'expired'
+        : 'monitoring';
+  const formatDateTime = value => value ? new Date(value).toLocaleString() : 'Not checked yet';
+  const percent = product.savingsPercent ?? product.priceDropSavingsPercent;
+  return <article className="tracked-card">
+    <div className="tracked-main">
+      {product.imageUrl
+        ? <img className="tracked-image" src={product.imageUrl} alt="" loading="lazy" referrerPolicy="no-referrer"/>
+        : <div className="product-dot"><PackageCheck size={16}/></div>}
+      <div className="product-info">
+        <b>{product.name || product.product}</b>
+        <small>{product.merchant || product.retailer || 'Retailer'} · Purchased {product.purchaseDate || product.date}</small>
+        <small>{product.monitoringStartDate || 'Start pending'} through {product.monitoringExpirationDate || 'Expiration pending'} · {status === 'WATCH EXPIRED' ? 'watch period expired' : `${product.daysRemaining} day${product.daysRemaining === 1 ? '' : 's'} remaining`}</small>
+        {product.originalUrlVerified && product.url
+          ? <small><a href={product.url} target="_blank" rel="noreferrer">Verified original retailer page <ExternalLink size={11}/></a></small>
+          : product.url
+            ? <small>Submitted URL is not verified: <a href={product.url} target="_blank" rel="noreferrer">Review page <ExternalLink size={11}/></a></small>
+            : <small>No verified original retailer URL</small>}
+        {product.returnPolicyUrl && <small><a href={product.returnPolicyUrl} target="_blank" rel="noreferrer">Retailer return/price policy <ExternalLink size={11}/></a></small>}
+      </div>
+      <span className={`monitoring-badge ${statusClass}`}>{validDrop ? 'PRICE DROP DETECTED' : status}</span>
+      <div className="price-col"><span>Original purchase</span><b>{money(product.purchasePrice)}</b></div>
+      <div className="price-col"><span>Verified current</span><b className={validDrop ? 'drop-price' : ''}>{money(verifiedCurrentPrice)}</b></div>
+      {validDrop && <span className="drop-badge"><TrendingDown size={13}/> Save {money(product.potentialSavings ?? product.priceDropSavings)}{percent != null ? ` (${Number(percent).toFixed(1)}%)` : ''}</span>}
+      {product.source === 'manual' && <button className="icon-button delete" title="Remove tracked product" onClick={() => onDelete(product.id)}><Trash2 size={16}/></button>}
+    </div>
+    <div className="monitor-details">
+      <span>Last checked: <b>{formatDateTime(product.lastCheckedAt)}</b></span>
+      <span>Next check: <b>{product.nextCheckAt ? formatDateTime(product.nextCheckAt) : 'Not scheduled'}</b></span>
+      <span>Previous verified: <b>{money(product.previousVerifiedPrice)}</b></span>
+      <span>Lowest verified: <b>{money(product.lowestVerifiedPrice)}</b></span>
+      <span>Highest verified: <b>{money(product.highestVerifiedPrice)}</b></span>
+      <span>Potential savings: <b>{money(product.potentialSavings)}{percent != null ? ` (${Number(percent).toFixed(1)}%)` : ''}</b></span>
+      <span>Notification status: <b>{validDrop ? String(product.notificationStatus || 'not_sent').toUpperCase() : 'NOT SENT'}</b></span>
+      <span>Notifications sent: <b>{product.notificationCount || 0}</b></span>
+      <span>First drop: <b>{product.firstPriceDropAt ? formatDateTime(product.firstPriceDropAt) : 'None detected'}</b></span>
+    </div>
+    {product.lastError && <p className="monitor-error">{product.lastError}</p>}
+    {status === 'PURCHASE DATE NEEDS CONFIRMATION' && <div className="product-confirmation">
+      <label>Confirm or correct purchase date
+        <input type="date" value={dateDraft} onChange={event => setDateDraft(event.target.value)}/>
+      </label>
+      <button className="secondary" disabled={busy || !dateDraft} onClick={() => onConfirmDate(product.id, dateDraft)}>Confirm date</button>
+      <span>Monitoring and alerts are paused until you confirm this date.</span>
+    </div>}
+    {!product.originalUrlVerified && status !== 'PURCHASE DATE NEEDS CONFIRMATION' && <div className="product-confirmation">
+      <button className="secondary" disabled={busy} onClick={() => onDiscover(product.id)}>
+        {product.discoveryStatus === 'needs_confirmation' ? 'Search again' : 'Find / verify original retailer URL'}
+      </button>
+      <span>Only matching original-retailer pages are eligible for price-drop alerts.</span>
+    </div>}
+    {(product.discoveryCandidates || []).length > 1 && <div className="product-confirmation candidate-list">
+      <b>Confirm the matching {product.retailer || 'retailer'} listing</b>
+      {product.discoveryCandidates.map(candidate => <div key={candidate.url}>
+        <span>{candidate.title}{candidate.priceVerified ? ` · ${money(candidate.price)}` : ' · Current price unavailable'}</span>
+        <a href={candidate.url} target="_blank" rel="noreferrer">Review listing <ExternalLink size={11}/></a>
+        <button className="secondary" disabled={busy} onClick={() => onConfirmUrl(product.id, candidate.url)}>Use this listing</button>
+      </div>)}
+    </div>}
+    {history.length > 0 && <div className="price-history"><b>Verified price history</b><span>{history.slice(-10).map(snapshot => `${money(snapshot.price)} · ${new Date(snapshot.checkedAt).toLocaleString()}`).join('  →  ')}</span></div>}
+    {alternativeOffers.length > 0 && <div className="price-history alternative-history">
+      <b>Other retailer offers · verified separately</b>
+      {alternativeOffers.slice(0, 5).map(offer => <span key={offer.url}>
+        <strong>{offer.retailer}: {money(offer.price)}</strong>
+        {product.cheapestAlternative?.url === offer.url && ' · Cheapest verified offer below current tracked-store price'}
+        {' · '}Verified {formatDateTime(offer.lastVerifiedAt)}
+        {` · Range ${money(offer.lowestVerifiedPrice)}–${money(offer.highestVerifiedPrice)}`}
+        {' · '}<a href={offer.url} target="_blank" rel="noreferrer">View alternative <ExternalLink size={11}/></a>
+        {offer.priceHistory?.length > 1 && ` · History: ${offer.priceHistory.slice(-5).map(snapshot => money(snapshot.price)).join(' → ')}`}
+      </span>)}
+      <span>Alternative offers do not affect original-retailer price-drop detection or notifications.</span>
+    </div>}
+    {!alternativeOffers.length && <div className="price-history alternative-history">
+      <b>Other retailer offers</b>
+      <span>{product.alternativeDiscoveryStatus === 'searching'
+        ? 'Search in progress'
+        : product.alternativeDiscoveryStatus === 'no_verified_matches'
+          ? 'No exact, verified alternative offers found'
+          : product.alternativeDiscoveryStatus === 'unavailable'
+            ? 'Public search or product verification is unavailable'
+            : 'No verified alternative offers yet'}
+        {product.nextAlternativeSearchAt && ` · Next search ${formatDateTime(product.nextAlternativeSearchAt)}`}
+      </span>
+    </div>}
+    {!alternativeOffers.length && product.alternativeDiscoveryError && <p className="monitor-error">Alternative search: {product.alternativeDiscoveryError}</p>}
+    {notifications.length > 0 && <div className="notification-history">
+      <b>Email notification history</b>
+      {notifications.map((item, index) => <span key={`${item.detectedAt}-${index}`} className={`notification-event ${item.status}`}>
+        {item.status.toUpperCase()} · {money(item.price)} · {item.sentAt ? formatDateTime(item.sentAt) : formatDateTime(item.detectedAt)}
+        {item.error ? ` · ${item.error}` : ''}
+      </span>)}
+    </div>}
+  </article>;
+}
+
+createRoot(document.getElementById('root')).render(<App/>);
