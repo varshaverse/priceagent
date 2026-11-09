@@ -61,6 +61,8 @@ export function extractRetailerProductPage(html, productUrl) {
   });
   const productScope = $('[itemtype*="Product"][itemscope]').first();
   const scopedPrice = productScope.find('[itemprop="price"]').first();
+  const scopedSku = productScope.find('[itemprop="sku"], [itemprop="mpn"]').first().text().trim();
+  const scopedDescription = productScope.find('[itemprop="description"]').first().text().trim();
   const currency =
     $('meta[property="product:price:currency"]').attr('content') ||
     productScope.find('[itemprop="priceCurrency"]').first().attr('content') ||
@@ -110,11 +112,15 @@ export function extractRetailerProductPage(html, productUrl) {
   return {
     url: parsedUrl.toString(),
     title: pageTitle,
+    productTitle: Boolean(textValue(entity.name)),
+    productSchema: entities.length > 0 || productScope.length > 0,
     brand: textValue(entity.brand) ||
       $('meta[property="product:brand"]').attr('content') ||
       '',
     model: textValue(entity.model),
-    sku: textValue(entity.sku || entity.mpn),
+    sku: textValue(entity.sku || entity.mpn) || scopedSku,
+    productSku: Boolean(textValue(entity.sku || entity.mpn) || scopedSku),
+    productDetails: Boolean(textValue(entity.description) || scopedDescription),
     description: String(
       textValue(entity.description) ||
       $('meta[name="description"]').attr('content') ||

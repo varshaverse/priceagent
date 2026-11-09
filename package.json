@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "concurrently --kill-others-on-fail \"npm run server\" \"npm run client\"",
+    "predev": "node scripts/ensure-playwright-browser.js",
+    "dev": "node scripts/dev.js",
     "server": "node server/index.js",
     "client": "node scripts/wait-for-backend.js && vite --host 127.0.0.1",
     "build": "vite build",
@@ -20,6 +21,7 @@
     "googleapis": "^189.0.0",
     "lucide-react": "^0.468.0",
     "multer": "^1.4.5-lts.1",
+    "playwright": "^1.56.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "sharp": "^0.35.5"

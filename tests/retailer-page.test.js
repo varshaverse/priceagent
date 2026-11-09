@@ -34,6 +34,10 @@ test('extracts product identity and a current USD schema.org offer from the prod
   assert.equal(page.price, 149.99);
   assert.equal(page.currency, 'USD');
   assert.equal(page.verified, true);
+  assert.equal(page.productTitle, true);
+  assert.equal(page.productSchema, true);
+  assert.equal(page.productSku, true);
+  assert.equal(page.productDetails, true);
   assert.equal(page.imageUrl, 'https://store.example/images/ninja.jpg');
 });
 
@@ -47,6 +51,8 @@ test('product identity remains usable for URL matching when no verified price is
   assert.equal(page.title, 'Ninja Crispi FN101');
   assert.equal(page.price, null);
   assert.equal(page.verified, false);
+  assert.equal(page.productTitle, false);
+  assert.equal(page.productSchema, false);
 });
 
 test('ignores out-of-stock offers and rejects non-USD prices as verified values', () => {

@@ -4,6 +4,7 @@ import { createServer } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import { isBackendReady } from '../scripts/dev.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const readinessScript = path.join(projectRoot, 'scripts', 'wait-for-backend.js');
@@ -12,6 +13,29 @@ test('dev client waits for the backend readiness endpoint before starting', asyn
   const server = createServer((request, response) => {
     response.writeHead(request.url === '/api/ready' ? 204 : 404);
     response.end();
+  });
+
+  test('dev launcher recognizes an already-running PriceDrop API', async () => {
+    const server = createServer((request, response) => {
+      response.writeHead(request.url === '/api/ready' ? 204 : 404);
+      response.end();
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address();
+    try {
+      assert.equal(
+        await isBackendReady(`http://127.0.0.1:${port}/api/ready`),
+        true
+      );
+      assert.equal(
+        await isBackendReady(`http://127.0.0.1:${port}/not-the-ready-endpoint`),
+        false
+      );
+    } finally {
+      await new Promise((resolve, reject) => server.close(error =>
+        error ? reject(error) : resolve()
+      ));
+    }
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const { port } = server.address();

@@ -12,6 +12,12 @@ import {
   monitoringDashboardStats,
   monitoringStatusFor,
   monitoringWindow,
+  normalizeReceiptDate,
+  receiptDateFromEvidence,
+  receiptDateState,
+  receiptDateNeedsConfirmation,
+  shouldAttemptProductDiscovery,
+  watchStatusFor,
   startMonitoringScheduler
 } from '../server/monitoring.js';
 
@@ -62,11 +68,42 @@ test('a product without a verified original URL cannot be a price drop', async (
       fetchVerifiedPrice: async () => { fetchCount++; return { price: 1, currency: 'USD', verified: true }; },
       sendNotification: async () => { sendCount++; }
     });
-    assert.equal(result.status, 'URL DISCOVERY');
-    assert.equal(product.monitoringStatus, 'URL DISCOVERY');
+    assert.equal(result.status, 'AWAITING PRODUCT URL');
+    assert.equal(product.monitoringStatus, 'AWAITING PRODUCT URL');
     assert.equal(fetchCount, 0);
     assert.equal(sendCount, 0);
-    assert.equal(monitoringStatusFor(product, now), 'URL DISCOVERY');
+    assert.equal(monitoringStatusFor(product, now), 'AWAITING PRODUCT URL');
+});
+
+test('a found retailer URL remains visible while identity or price verification retries', async () => {
+  const product = makeProduct({
+    url: 'https://store.example/products/item',
+    originalUrlVerified: false,
+    discoveryStatus: 'found',
+    monitoringStatus: 'URL FOUND'
+  });
+  let fetchCount = 0;
+  const result = await checkMonitoredProduct({
+    product,
+    now,
+    intervalMs,
+    fetchVerifiedPrice: async () => {
+      fetchCount++;
+      return { price: 20, currency: 'USD', verified: true };
+    },
+    sendNotification: async () => {}
+  });
+  assert.equal(result.status, 'URL FOUND');
+  assert.equal(monitoringStatusFor(product, now), 'URL FOUND');
+  assert.equal(fetchCount, 0);
+});
+
+test('a verified retailer URL is exposed as URL VERIFIED until price monitoring runs', () => {
+  const product = makeProduct({
+    discoveryStatus: 'matched',
+    monitoringStatus: 'URL VERIFIED'
+  });
+  assert.equal(monitoringStatusFor(product, now), 'URL VERIFIED');
 });
 
 test('a stale drop status without a verified current price is unavailable and not counted', () => {
@@ -127,6 +164,7 @@ test('future purchase dates are not monitored until confirmed and use local cale
     assert.equal(fetchCount, 0);
 
     product.purchaseDateConfirmed = true;
+    product.purchaseDateConfirmedByUser = true;
     const waiting = await checkMonitoredProduct({
       product,
       now: localLateNight,
@@ -140,13 +178,159 @@ test('future purchase dates are not monitored until confirmed and use local cale
   assert.equal(product.monitoringStartDate, '2026-11-05');
 });
 
-test('only valid non-future receipts fewer than 30 days old remain in the monitoring window', () => {
+test('valid non-future receipts under 30 days old remain in the monitoring window', () => {
     const localNow = new Date(2026, 10, 4, 12);
     assert.equal(isWithinMonitoringWindow('2026-10-06', localNow), true);
     assert.equal(isWithinMonitoringWindow('2026-10-05', localNow), false);
     assert.equal(isWithinMonitoringWindow('2026-10-04', localNow), false);
     assert.equal(isWithinMonitoringWindow('2026-11-05', localNow), false);
     assert.equal(isWithinMonitoringWindow('not-a-date', localNow), false);
+});
+
+test('receipt dates require a complete, unambiguous date with a year', () => {
+  assert.equal(normalizeReceiptDate('2026-11-06'), '2026-11-06');
+  assert.equal(normalizeReceiptDate('Nov 6, 2026'), '2026-11-06');
+  assert.equal(normalizeReceiptDate('October 30th, 2026'), '2026-10-30');
+  assert.equal(normalizeReceiptDate('30 October 2026'), '2026-10-30');
+  assert.equal(normalizeReceiptDate('10/30/26'), '2026-10-30');
+  assert.equal(normalizeReceiptDate('30-Oct-26'), '2026-10-30');
+  assert.equal(normalizeReceiptDate('2026/11/06'), '2026-11-06');
+  assert.equal(normalizeReceiptDate('07-07'), null);
+  assert.equal(normalizeReceiptDate('11/06/2026'), null);
+  assert.equal(normalizeReceiptDate('2026-02-30'), null);
+  assert.equal(normalizeReceiptDate(null), null);
+});
+
+test('receipt dates are accepted only when supported by clear matching printed evidence', () => {
+  assert.equal(receiptDateFromEvidence('Nov 6, 2026'), '2026-11-06');
+  assert.equal(receiptDateFromEvidence('03/04/2026'), null);
+  assert.equal(receiptDateFromEvidence('11/06/2026 14:32'), null);
+  assert.equal(receiptDateFromEvidence('11/22/2026'), '2026-11-22');
+  assert.equal(receiptDateFromEvidence(''), null);
+  // A model-supplied normalization can never override the printed text.
+  assert.equal(receiptDateFromEvidence('Nov 6, 2026', '2026-07-11'), '2026-11-06');
+});
+
+test('a valid printed date controls status regardless of when the image was uploaded', async () => {
+  const now = new Date('2026-11-08T16:00:00-08:00');
+  const uploadedAt = '2026-11-06T10:00:00-08:00';
+  assert.equal(
+    receiptDateNeedsConfirmation('2026-07-07', uploadedAt, false, now),
+    false
+  );
+  assert.equal(
+    receiptDateNeedsConfirmation('2026-11-06', uploadedAt, false, now),
+    false
+  );
+  assert.equal(
+    receiptDateNeedsConfirmation('2026-10-30', uploadedAt, false, now),
+    false
+  );
+  assert.equal(watchStatusFor('2026-10-30', now), 'WATCH');
+  assert.equal(
+    receiptDateNeedsConfirmation('2026-07-07', uploadedAt, true, now),
+    false
+  );
+  assert.equal(watchStatusFor('2026-07-07', now), 'WATCH EXPIRED');
+
+  const product = makeProduct({
+    purchaseDate: '2026-07-07',
+    date: '2026-07-07',
+    purchaseDateNeedsConfirmation: false,
+    monitoringStatus: 'WATCH EXPIRED'
+  });
+
+  test('a November 6 receipt is automatically confirmed and WATCH on November 8', () => {
+    const now = new Date('2026-11-08T12:00:00-08:00');
+    assert.deepEqual(receiptDateState('2026-11-06', now), {
+      purchaseDateConfirmed: true,
+      purchaseDateNeedsConfirmation: false,
+      status: 'WATCH',
+      watch: 'yes'
+    });
+    assert.equal(normalizeReceiptDate('Nov 6, 2026'), '2026-11-06');
+  });
+
+  test('missing, future, invalid, and out-of-range dates require confirmation', () => {
+    const now = new Date('2026-11-08T12:00:00-08:00');
+    for (const date of [null, '2026-02-30', '2026-11-09', '1800-01-01', '2200-01-01']) {
+      assert.deepEqual(receiptDateState(date, now), {
+        purchaseDateConfirmed: false,
+        purchaseDateNeedsConfirmation: true,
+        status: 'PURCHASE DATE NEEDS CONFIRMATION',
+        watch: 'no'
+      });
+    }
+  });
+
+  test('product URL discovery is immediately eligible regardless of date confirmation', () => {
+    const now = new Date('2026-11-08T12:00:00-08:00');
+    for (const purchaseDate of [null, '2026-11-06', '2026-11-09']) {
+      assert.equal(shouldAttemptProductDiscovery({
+        purchaseDate,
+        purchaseDateNeedsConfirmation: !purchaseDate || purchaseDate === '2026-11-09',
+        url: '',
+        originalUrlVerified: false
+      }, now, true), true);
+    }
+    assert.equal(shouldAttemptProductDiscovery({
+      url: 'https://store.example/item',
+      originalUrlVerified: true
+    }, now, true), false);
+    assert.equal(shouldAttemptProductDiscovery({
+      url: '',
+      originalUrlVerified: false
+    }, now), false);
+    assert.equal(shouldAttemptProductDiscovery({
+      url: '',
+      originalUrlVerified: false,
+      nextProductDiscoveryAt: '2026-11-09T12:00:00.000Z'
+    }, now, true), false);
+  });
+  let fetchCount = 0;
+  const result = await checkMonitoredProduct({
+    product,
+    now,
+    intervalMs,
+    fetchVerifiedPrice: async () => {
+      fetchCount++;
+      return { price: 80, currency: 'USD', verified: true };
+    },
+    sendNotification: async () => {}
+  });
+  assert.equal(result.status, 'WATCH EXPIRED');
+  assert.equal(product.nextCheckAt, null);
+  assert.equal(fetchCount, 0);
+
+  assert.equal(monitoringStatusFor(product, now), 'WATCH EXPIRED');
+});
+
+test('a November 6 purchase remains WATCH on November 8 using date-only arithmetic', async () => {
+  const purchaseDate = '2026-11-06';
+  const checkDate = new Date('2026-11-08T23:59:00-08:00');
+  assert.equal(isWithinMonitoringWindow(purchaseDate, checkDate), true);
+  assert.equal(monitoringWindow(purchaseDate).startDate, '2026-11-06');
+  assert.equal(watchStatusFor(purchaseDate, checkDate), 'WATCH');
+
+  const product = makeProduct({
+    purchaseDate,
+    date: purchaseDate,
+    monitoringStartDate: purchaseDate
+  });
+  const result = await checkMonitoredProduct({
+    product,
+    now: checkDate,
+    intervalMs,
+    fetchVerifiedPrice: async () => ({ price: 100, currency: 'USD', verified: true }),
+    sendNotification: async () => {}
+  });
+  assert.equal(result.status, 'MONITORING');
+  assert.equal(product.monitoringStartDate, '2026-11-06');
+});
+
+test('missing purchase dates require confirmation and purchases past the window expire', () => {
+  assert.equal(watchStatusFor(null, now), 'PURCHASE DATE NEEDS CONFIRMATION');
+  assert.equal(watchStatusFor('2026-10-04', now), 'WATCH EXPIRED');
 });
 
 test('dashboard statistics count valid records, verified URLs, unavailable prices, and only verified drops', () => {
@@ -198,7 +382,7 @@ test('verified price above purchase price records no drop and sends no email', a
   const product = makeProduct();
   let sendCount = 0;
   const result = await check(product, { price: 105, send: async () => sendCount++ });
-  assert.equal(result.status, 'NO PRICE DROP');
+  assert.equal(result.status, 'MONITORING');
   assert.equal(product.currentVerifiedPrice, 105);
   assert.equal(product.previousVerifiedPrice, null);
   assert.equal(product.potentialSavings, 0);
@@ -208,7 +392,7 @@ test('verified price above purchase price records no drop and sends no email', a
 test('verified price equal to purchase price records no drop', async () => {
   const product = makeProduct();
   const result = await check(product, { price: 100 });
-  assert.equal(result.status, 'NO PRICE DROP');
+  assert.equal(result.status, 'MONITORING');
   assert.equal(product.priceDropDetectedAt, undefined);
   assert.equal(product.notificationHistory.length, 0);
 });
@@ -229,6 +413,50 @@ test('verified price below purchase price records savings and notifies automatic
   assert.equal(product.notificationHistory[0].status, 'sent');
 });
 
+test('a verified $20 price against a $50 purchase triggers a $30 price drop', async () => {
+  const product = makeProduct({ purchasePrice: 50 });
+  let notificationCount = 0;
+  const result = await check(product, {
+    price: 20,
+    send: async () => { notificationCount++; }
+  });
+  assert.equal(result.status, 'PRICE DROP DETECTED');
+  assert.equal(product.priceDropSavings, 30);
+  assert.equal(product.currentVerifiedPrice, 20);
+  assert.equal(notificationCount, 1);
+});
+
+test('a below-purchase price is not emailed until the purchase date is valid and active', async () => {
+  const product = makeProduct({
+    purchasePrice: 50,
+    purchaseDate: null,
+    date: null,
+    purchaseDateNeedsConfirmation: true,
+    purchaseDateConfirmed: false
+  });
+  let notificationCount = 0;
+  const paused = await check(product, {
+    price: 20,
+    send: async () => { notificationCount++; }
+  });
+  assert.equal(paused.status, 'PURCHASE DATE NEEDS CONFIRMATION');
+  assert.equal(notificationCount, 0);
+
+  Object.assign(product, {
+    purchaseDate: '2026-11-06',
+    date: '2026-11-06',
+    purchaseDateNeedsConfirmation: false,
+    purchaseDateConfirmed: true
+  });
+  const active = await check(product, {
+    price: 20,
+    now: new Date('2026-11-08T12:00:00-08:00'),
+    send: async () => { notificationCount++; }
+  });
+  assert.equal(active.status, 'PRICE DROP DETECTED');
+  assert.equal(notificationCount, 1);
+});
+
 test('expired monitoring period does not fetch or notify', async () => {
   const product = makeProduct({ purchaseDate: '2026-10-01', date: '2026-10-01' });
   let fetchCount = 0;
@@ -247,21 +475,22 @@ test('expired monitoring period does not fetch or notify', async () => {
   assert.equal(sendCount, 0);
 });
 
-test('day 30 is the first day off-watch and never triggers a retailer fetch', async () => {
-  const product = makeProduct({ purchaseDate: '2026-10-05', date: '2026-10-05' });
+test('day 29 is still on watch and day 30 is expired and never fetched', async () => {
+  const today = new Date('2026-11-04T12:00:00');
   let fetchCount = 0;
-  let sendCount = 0;
-  const result = await checkMonitoredProduct({
-    product,
-    now,
+  const run = purchaseDate => checkMonitoredProduct({
+    product: makeProduct({ purchaseDate, date: purchaseDate }),
+    now: today,
     intervalMs,
-    fetchVerifiedPrice: async () => { fetchCount++; return { price: 20, currency: 'USD', verified: true }; },
-    sendNotification: async () => { sendCount++; }
+    fetchVerifiedPrice: async () => { fetchCount++; return { price: 100, currency: 'USD', verified: true }; },
+    sendNotification: async () => {}
   });
-  assert.equal(result.status, 'WATCH EXPIRED');
-  assert.equal(product.nextCheckAt, null);
-  assert.equal(fetchCount, 0);
-  assert.equal(sendCount, 0);
+  assert.equal((await run('2026-10-06')).status, 'MONITORING');
+  assert.equal(fetchCount, 1);
+  assert.equal((await run('2026-10-05')).status, 'WATCH EXPIRED');
+  assert.equal(fetchCount, 1);
+  assert.equal(watchStatusFor('2026-10-06', today), 'WATCH');
+  assert.equal(watchStatusFor('2026-10-05', today), 'WATCH EXPIRED');
 });
 
 test('unverifiable retailer price records unavailable and schedules retry', async () => {
@@ -282,7 +511,7 @@ test('unverifiable retailer price records unavailable and schedules retry', asyn
     price: 105,
     now: new Date(now.getTime() + intervalMs)
   });
-  assert.equal(retryResult.status, 'NO PRICE DROP');
+  assert.equal(retryResult.status, 'MONITORING');
   assert.equal(product.currentVerifiedPrice, 105);
 });
 
@@ -326,7 +555,7 @@ test('a failed notification remains retryable on the next scheduled check', asyn
   assert.deepEqual(product.notificationHistory.map(item => item.status), ['failed', 'sent']);
 });
 
-test('duplicate drops are suppressed; a further drop of at least five percent and one dollar can notify', async () => {
+test('same-price notifications are suppressed but every changed lower price can notify', async () => {
   const product = makeProduct();
   let sendCount = 0;
   await check(product, { price: 90, send: async () => sendCount++ });
@@ -337,7 +566,7 @@ test('duplicate drops are suppressed; a further drop of at least five percent an
   });
   assert.equal(duplicate.notification, 'duplicate_suppressed');
   const furtherDrop = await check(product, {
-    price: 85,
+    price: 89.99,
     now: new Date(now.getTime() + intervalMs * 2),
     send: async () => sendCount++
   });

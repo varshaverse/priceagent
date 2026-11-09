@@ -1,6 +1,6 @@
-export const PRICE_DROP_THRESHOLD_PERCENT = 5;
-export const PRICE_DROP_THRESHOLD_DOLLARS = 1;
 const DAY_MS = 24 * 60 * 60 * 1000;
+const MIN_SUPPORTED_YEAR = 1900;
+const MAX_SUPPORTED_YEAR = 2100;
 
 function dateOnly(value) {
   return /^\d{4}-\d{2}-\d{2}$/.test(value || '') ? value : '';
@@ -9,9 +9,119 @@ function dateOnly(value) {
 export function isValidDateOnly(value) {
   const date = dateOnly(value);
   if (!date) return false;
+  const year = Number(date.slice(0, 4));
+  if (year < MIN_SUPPORTED_YEAR || year > MAX_SUPPORTED_YEAR) return false;
   const timestamp = Date.parse(`${date}T00:00:00.000Z`);
   return Number.isFinite(timestamp) &&
     new Date(timestamp).toISOString().slice(0, 10) === date;
+}
+
+function dateFromParts(year, month, day) {
+  if (Number(year) < MIN_SUPPORTED_YEAR || Number(year) > MAX_SUPPORTED_YEAR) {
+    return null;
+  }
+  const date = `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  return isValidDateOnly(date) ? date : null;
+}
+
+const MONTH_NAMES = new Map([
+  ['jan', 1], ['january', 1], ['feb', 2], ['february', 2],
+  ['mar', 3], ['march', 3], ['apr', 4], ['april', 4],
+  ['may', 5], ['jun', 6], ['june', 6], ['jul', 7], ['july', 7],
+  ['aug', 8], ['august', 8], ['sep', 9], ['sept', 9], ['september', 9],
+  ['oct', 10], ['october', 10], ['nov', 11], ['november', 11],
+  ['dec', 12], ['december', 12]
+]);
+
+function expandYear(rawYear) {
+  const year = Number(rawYear);
+  if (String(rawYear).length !== 2) return year;
+  return year <= 49 ? 2000 + year : 1900 + year;
+}
+
+function parseDateText(dateText, { dateOrder } = {}) {
+  if (isValidDateOnly(dateText)) return dateText;
+
+  const yearFirst = dateText.match(/^(\d{4})[./-](\d{1,2})[./-](\d{1,2})$/);
+  if (yearFirst) return dateFromParts(yearFirst[1], yearFirst[2], yearFirst[3]);
+
+  const namedMonth =
+    dateText.match(/^([A-Za-z]+)\.?\s+(\d{1,2}),?\s+(\d{4})$/) ||
+    dateText.match(/^(\d{1,2})\s+([A-Za-z]+)\.?,?\s+(\d{4})$/);
+  if (namedMonth) {
+    const monthFirst = /^[A-Za-z]/.test(namedMonth[1]);
+    const month = MONTH_NAMES.get(
+      (monthFirst ? namedMonth[1] : namedMonth[2]).toLowerCase()
+    );
+    if (!month) return null;
+    return dateFromParts(
+      namedMonth[3],
+      month,
+      monthFirst ? namedMonth[2] : namedMonth[1]
+    );
+  }
+
+  const abbreviatedMonth =
+    dateText.match(/^([A-Za-z]{3})[ -](\d{1,2}),?[ -](\d{2,4})$/) ||
+    dateText.match(/^(\d{1,2})[ -]([A-Za-z]{3}),?[ -](\d{2,4})$/);
+  if (abbreviatedMonth) {
+    const monthFirst = /^[A-Za-z]/.test(abbreviatedMonth[1]);
+    const month = MONTH_NAMES.get(
+      (monthFirst ? abbreviatedMonth[1] : abbreviatedMonth[2]).toLowerCase()
+    );
+    if (!month) return null;
+    return dateFromParts(
+      expandYear(abbreviatedMonth[3]),
+      month,
+      monthFirst ? abbreviatedMonth[2] : abbreviatedMonth[1]
+    );
+  }
+
+  const numeric = dateText.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})$/);
+  if (!numeric || numeric[3].length === 3) return null;
+  const first = Number(numeric[1]);
+  const second = Number(numeric[2]);
+  const year = expandYear(numeric[3]);
+  if (first === second) return dateFromParts(year, first, second);
+  if (first > 12 && second <= 12) return dateFromParts(year, second, first);
+  if (second > 12 && first <= 12) return dateFromParts(year, first, second);
+  if (dateOrder === 'MDY') return dateFromParts(year, first, second);
+  return null;
+}
+
+const EMBEDDED_DATE_PATTERNS = [
+  /\b\d{4}[./-]\d{1,2}[./-]\d{1,2}\b/,
+  /\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b/,
+  /\b[A-Za-z]{3,9}\.?\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}\b/,
+  /\b\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]{3,9}\.?,?\s+\d{4}\b/
+];
+
+export function normalizeReceiptDate(value, options) {
+  if (typeof value !== 'string') return null;
+  const cleaned = value.trim().replace(/(\d)(st|nd|rd|th)\b/gi, '$1');
+  const direct = parseDateText(
+    cleaned
+      .replace(/^[A-Za-z]+,\s*/, '')
+      .replace(/\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?$/i, '')
+      .trim(),
+    options
+  );
+  if (direct) return direct;
+  for (const pattern of EMBEDDED_DATE_PATTERNS) {
+    const match = cleaned.match(pattern);
+    if (match) {
+      const parsed = parseDateText(match[0].trim(), options);
+      if (parsed) return parsed;
+    }
+  }
+  return null;
+}
+
+// The printed text is authoritative: the model's own normalized date is never
+// trusted over it, which prevents errors such as November 6 becoming July 11.
+export function receiptDateFromEvidence(evidence, options) {
+  if (typeof evidence !== 'string' || !evidence.trim()) return null;
+  return normalizeReceiptDate(evidence, options);
 }
 
 export function localDateString(now = new Date()) {
@@ -33,6 +143,56 @@ export function isWithinMonitoringWindow(purchaseDate, now = new Date()) {
   return Boolean(expirationDate) && localDateString(now) < expirationDate;
 }
 
+export function receiptDateNeedsConfirmation(
+  purchaseDate,
+  _uploadedAt,
+  confirmedByUser = false,
+  now = new Date()
+) {
+  if (confirmedByUser) return false;
+  return !isValidDateOnly(purchaseDate) || isFutureDateOnly(purchaseDate, now);
+}
+
+export function watchStatusFor(purchaseDate, now = new Date()) {
+  if (!isValidDateOnly(purchaseDate) || isFutureDateOnly(purchaseDate, now)) {
+    return 'PURCHASE DATE NEEDS CONFIRMATION';
+  }
+  return isWithinMonitoringWindow(purchaseDate, now) ? 'WATCH' : 'WATCH EXPIRED';
+}
+
+export function receiptDateState(purchaseDate, now = new Date()) {
+  const valid = isValidDateOnly(purchaseDate);
+  const confirmed = valid && !isFutureDateOnly(purchaseDate, now);
+  const needsConfirmation = !valid || !confirmed;
+  const status = needsConfirmation
+    ? 'PURCHASE DATE NEEDS CONFIRMATION'
+    : watchStatusFor(purchaseDate, now);
+  return {
+    purchaseDateConfirmed: confirmed,
+    purchaseDateNeedsConfirmation: needsConfirmation,
+    status,
+    watch: confirmed && isWithinMonitoringWindow(purchaseDate, now)
+      ? 'yes'
+      : 'no'
+  };
+}
+
+export function shouldAttemptProductDiscovery(
+  product,
+  now = new Date(),
+  requested = false
+) {
+  if (!requested) return false;
+  if (product.originalUrlVerified === true && product.url) return false;
+  const retryAt = Date.parse(product.nextProductDiscoveryAt || '');
+  return !Number.isFinite(retryAt) || now.getTime() >= retryAt;
+}
+
+export function shouldAutomaticallyDiscoverProduct(product, purchaseDate, now = new Date()) {
+  return watchStatusFor(purchaseDate, now) !== 'WATCH EXPIRED' &&
+    shouldAttemptProductDiscovery(product, now, true);
+}
+
 export function monitoringWindow(purchaseDate) {
   const start = dateOnly(purchaseDate);
   const startTime = start ? Date.parse(`${start}T00:00:00.000Z`) : Number.NaN;
@@ -48,11 +208,12 @@ export function monitoringWindow(purchaseDate) {
 
 export function ensureMonitoringMetadata(product, purchaseDate) {
   const window = monitoringWindow(purchaseDate);
-  if (!product.monitoringStartDate && window.valid) {
+  if (window.valid) {
     product.monitoringStartDate = window.startDate;
-  }
-  if (!product.monitoringExpirationDate && window.valid) {
     product.monitoringExpirationDate = window.expirationDate;
+  } else {
+    product.monitoringStartDate = '';
+    product.monitoringExpirationDate = '';
   }
   if (!Array.isArray(product.priceHistory)) product.priceHistory = [];
   if (!Array.isArray(product.notificationHistory)) product.notificationHistory = [];
@@ -121,14 +282,16 @@ export function ensureMonitoringMetadata(product, purchaseDate) {
 export function monitoringStatusFor(product, now = new Date()) {
   const purchaseDate = product.purchaseDate || product.date;
   if (!isValidDateOnly(purchaseDate)) return 'PURCHASE DATE NEEDS CONFIRMATION';
+  if (
+    product.purchaseDateNeedsConfirmation &&
+    product.purchaseDateConfirmedByUser !== true
+  ) return 'PURCHASE DATE NEEDS CONFIRMATION';
   if (isFutureDateOnly(purchaseDate, now) && !product.purchaseDateConfirmed) {
     return 'PURCHASE DATE NEEDS CONFIRMATION';
   }
-  const expirationDate = product.monitoringExpirationDate ||
-    monitoringWindow(purchaseDate).expirationDate;
+  const expirationDate = monitoringWindow(purchaseDate).expirationDate;
   const nowDate = localDateString(now);
   if (!expirationDate || nowDate >= expirationDate) return 'WATCH EXPIRED';
-  if (product.discoveryStatus === 'needs_confirmation') return 'NEEDS CONFIRMATION';
   let validVerifiedUrl = false;
   try {
     const url = new URL(product.url);
@@ -137,7 +300,11 @@ export function monitoringStatusFor(product, now = new Date()) {
   } catch {
     validVerifiedUrl = false;
   }
-  if (!validVerifiedUrl) return 'URL DISCOVERY';
+  if (!validVerifiedUrl) {
+    if (product.discoveryStatus === 'searching') return 'SEARCHING FOR PRODUCT URL';
+    if (product.discoveryStatus === 'found' && product.url) return 'URL FOUND';
+    return 'AWAITING PRODUCT URL';
+  }
   if (
     product.monitoringStatus === 'PRICE DROP DETECTED' &&
     (
@@ -153,9 +320,20 @@ export function monitoringStatusFor(product, now = new Date()) {
       !Number.isFinite(Number(product.purchasePrice)) ||
       Number(product.purchasePrice) <= 0
       ? 'PRICE UNAVAILABLE'
-      : 'NO PRICE DROP';
+      : 'MONITORING';
   }
-  return product.monitoringStatus || 'MONITORING';
+  return [
+    'NO PRICE DROP',
+    'URL DISCOVERY',
+    'NEEDS CONFIRMATION',
+    'PURCHASE DATE NEEDS CONFIRMATION',
+    'WATCH EXPIRED',
+    'SEARCHING FOR PRODUCT URL',
+    'URL FOUND',
+    'AWAITING PRODUCT URL'
+  ].includes(product.monitoringStatus)
+    ? 'MONITORING'
+    : product.monitoringStatus || 'MONITORING';
 }
 
 export function monitoringDashboardStats(products) {
@@ -231,12 +409,21 @@ export async function checkMonitoredProduct({
 }) {
   ensureMonitoringMetadata(product, purchaseDate);
   const timestamp = now.toISOString();
-  const expirationDate = product.monitoringExpirationDate;
+  const expirationDate = monitoringWindow(purchaseDate).expirationDate;
   const today = localDateString(now);
   product.monitoringStartDate ||= purchaseDate;
 
   if (!isValidDateOnly(purchaseDate)) {
     product.purchaseDateNeedsConfirmation = true;
+    product.monitoringStatus = 'PURCHASE DATE NEEDS CONFIRMATION';
+    product.nextCheckAt = null;
+    return { status: product.monitoringStatus, checked: false };
+  }
+
+  if (
+    product.purchaseDateNeedsConfirmation &&
+    product.purchaseDateConfirmedByUser !== true
+  ) {
     product.monitoringStatus = 'PURCHASE DATE NEEDS CONFIRMATION';
     product.nextCheckAt = null;
     return { status: product.monitoringStatus, checked: false };
@@ -279,18 +466,18 @@ export async function checkMonitoredProduct({
   }
 
   if (!product.url) {
-    product.monitoringStatus = product.discoveryStatus === 'needs_confirmation'
-      ? 'NEEDS CONFIRMATION'
-      : 'URL DISCOVERY';
-    product.lastError ||= 'A verified original-retailer product URL is required.';
-    product.nextCheckAt = null;
+    product.monitoringStatus = product.discoveryStatus === 'searching'
+      ? 'SEARCHING FOR PRODUCT URL'
+      : 'AWAITING PRODUCT URL';
+    product.nextCheckAt = product.nextProductDiscoveryAt || null;
     return { status: product.monitoringStatus, checked: true, reason: product.lastError };
   }
 
   if (product.originalUrlVerified !== true) {
-    product.monitoringStatus = 'URL DISCOVERY';
-    product.lastError ||= 'The product URL has not been verified as this exact retailer listing.';
-    product.nextCheckAt = null;
+    product.monitoringStatus = product.discoveryStatus === 'found' && product.url
+      ? 'URL FOUND'
+      : 'AWAITING PRODUCT URL';
+    product.nextCheckAt = product.nextProductDiscoveryAt || null;
     return { status: product.monitoringStatus, checked: false, reason: product.lastError };
   }
 
@@ -329,9 +516,9 @@ export async function checkMonitoredProduct({
   }
 
   const purchasePrice = Number(product.purchasePrice);
-  const previous = product.currentVerifiedPrice == null
-    ? Number.NaN
-    : Number(product.currentVerifiedPrice);
+  const previousValue =
+    product.currentVerifiedPrice ?? product.previousVerifiedPrice;
+  const previous = previousValue == null ? Number.NaN : Number(previousValue);
   product.previousVerifiedPrice = Number.isFinite(previous) ? previous : null;
   product.currentVerifiedPrice = price;
   product.currentPrice = price;
@@ -360,7 +547,7 @@ export async function checkMonitoredProduct({
   product.nextCheckAt = nextCheckAt(timestamp, intervalMs);
 
   if (price >= purchasePrice) {
-    product.monitoringStatus = 'NO PRICE DROP';
+    product.monitoringStatus = 'MONITORING';
     return { status: product.monitoringStatus, checked: true, price };
   }
 
@@ -375,19 +562,16 @@ export async function checkMonitoredProduct({
     .map(item => Number(item.price))
     .filter(value => Number.isFinite(value) && value > 0);
   const legacyLastSentPrice = Number(product.lastAlertedPrice);
-  const lastSentPrice = sentPrices.at(-1) ||
-    (Number.isFinite(legacyLastSentPrice) && legacyLastSentPrice > 0
-      ? legacyLastSentPrice
-      : null);
+  if (
+    Number.isFinite(legacyLastSentPrice) &&
+    legacyLastSentPrice > 0 &&
+    !sentPrices.includes(legacyLastSentPrice)
+  ) sentPrices.push(legacyLastSentPrice);
   const deliveryInProgress = product.notificationHistory.some(
     item => ['pending', 'sending'].includes(item.status) &&
       Number(item.price) === price
   );
-  const qualifies = lastSentPrice == null ||
-    price <= lastSentPrice - Math.max(
-      PRICE_DROP_THRESHOLD_DOLLARS,
-      lastSentPrice * PRICE_DROP_THRESHOLD_PERCENT / 100
-    );
+  const qualifies = !sentPrices.includes(price);
   if (!qualifies || deliveryInProgress) {
     return { status: product.monitoringStatus, checked: true, price, notification: 'duplicate_suppressed' };
   }

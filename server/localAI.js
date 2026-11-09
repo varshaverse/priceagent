@@ -1,26 +1,88 @@
-const AI_PROVIDER = process.env.AI_PROVIDER || 'ollama';
-const OLLAMA_URL = (process.env.OLLAMA_URL || 'http://127.0.0.1:11434')
-  .replace(/\/+$/, '');
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'gemma4:e4b';
-const RECEIPT_SYSTEM_PROMPT = 'You are PriceDrop Agent running locally. Extract only details supported by the provided receipt. Never invent prices, brands, dates, URLs, or product details. Return valid JSON only.';
+import 'dotenv/config';
 
-async function ollamaRequest(endpoint, options = {}) {
+const AI_PROVIDER = 'groq';
+
+const GROQ_URL = (
+  process.env.GROQ_URL || 'https://api.groq.com/openai/v1'
+).replace(/\/+$/, '');
+
+const GROQ_API_KEY = (process.env.GROQ_API_KEY || '').trim();
+
+const GROQ_MODEL =
+  process.env.GROQ_MODEL || 'qwen/qwen3.8-27b';
+
+// This export name is kept for compatibility with the existing server/index.js.
+const OLLAMA_MODEL = GROQ_MODEL;
+
+function positiveInteger(value, fallback) {
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0 ? number : fallback;
+}
+
+// Small output budgets keep requests under Groq's output-tokens-per-minute limit.
+const RECEIPT_MAX_TOKENS = positiveInteger(process.env.GROQ_RECEIPT_MAX_TOKENS, 900);
+const MATCH_MAX_TOKENS = positiveInteger(process.env.GROQ_MATCH_MAX_TOKENS, 200);
+const MAX_RATE_LIMIT_RETRIES = positiveInteger(process.env.GROQ_MAX_RETRIES, 3);
+const BACKOFF_BASE_MS = 1500;
+const BACKOFF_MAX_MS = 20000;
+
+export class GroqError extends Error {
+  constructor(message, { status = 0, retryAfterMs = 0 } = {}) {
+    super(message);
+    this.name = 'GroqError';
+    this.status = status;
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+export function groqBackoffDelayMs(attempt, retryAfterMs = 0) {
+  const exponential = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** attempt);
+  return Math.min(BACKOFF_MAX_MS, Math.max(exponential, retryAfterMs || 0));
+}
+
+function retryAfterMilliseconds(response) {
+  const header = response.headers?.get?.('retry-after');
+  const seconds = Number(header);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 0;
+}
+
+const RECEIPT_SYSTEM_PROMPT =
+  'You are PriceDrop Agent. Extract only details supported by the provided receipt. Never invent prices, brands, dates, URLs, or product details. Return valid JSON only.';
+
+async function groqRequest(endpoint, options = {}) {
+  const { fetchImpl = fetch, ...fetchOptions } = options;
+  if (!GROQ_API_KEY) {
+    throw new Error(
+      'GROQ_API_KEY is missing. Add a real Groq API key to the .env file.'
+    );
+  }
+
+  const requestUrl = `${GROQ_URL}${endpoint}`;
+
   let response;
+
   try {
-    response = await fetch(`${OLLAMA_URL}${endpoint}`, {
-      ...options,
-      signal: AbortSignal.timeout(options.timeout || 120000)
+    response = await fetchImpl(requestUrl, {
+      ...fetchOptions,
+      headers: {
+        Authorization: `Bearer ${GROQ_API_KEY}`,
+        'Content-Type': 'application/json',
+        ...(fetchOptions.headers || {})
+      },
+      signal: AbortSignal.timeout(fetchOptions.timeout || 120000)
     });
   } catch (error) {
-    throw new Error(
-      `Could not connect to Ollama at ${OLLAMA_URL}. Make sure Ollama is running. ${error.message}`
+    throw new GroqError(
+      `Could not connect to Groq at ${requestUrl}. ${error.message}`
     );
   }
 
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(
-      `Ollama returned ${response.status}: ${body.slice(0, 500)}`
+
+    throw new GroqError(
+      `Groq returned ${response.status}: ${body.slice(0, 500)}`,
+      { status: response.status, retryAfterMs: retryAfterMilliseconds(response) }
     );
   }
 
@@ -28,37 +90,29 @@ async function ollamaRequest(endpoint, options = {}) {
 }
 
 export async function getLocalAIStatus() {
-  if (AI_PROVIDER !== 'ollama') {
-    return {
-      provider: AI_PROVIDER,
-      model: OLLAMA_MODEL,
-      connected: false,
-      modelAvailable: false,
-      error: `Unsupported AI_PROVIDER "${AI_PROVIDER}". Set AI_PROVIDER=ollama.`
-    };
-  }
-
   try {
-    const response = await ollamaRequest('/api/tags', { timeout: 5000 });
+    const response = await groqRequest('/models', {
+      method: 'GET',
+      timeout: 10000
+    });
+
     const data = await response.json();
-    const models = Array.isArray(data.models) ? data.models : [];
-    const modelAvailable = models.some(model =>
-      model.name === OLLAMA_MODEL ||
-      model.name === `${OLLAMA_MODEL}:latest` ||
-      model.name?.split(':')[0] === OLLAMA_MODEL.split(':')[0] &&
-        OLLAMA_MODEL.endsWith(':latest')
-    );
+    const models = Array.isArray(data.data) ? data.data : [];
+    const modelAvailable = models.some(model => model.id === GROQ_MODEL);
 
     return {
       provider: AI_PROVIDER,
-      model: OLLAMA_MODEL,
+      model: GROQ_MODEL,
       connected: true,
-      modelAvailable
+      modelAvailable,
+      error: modelAvailable
+        ? ''
+        : `Groq is connected, but model "${GROQ_MODEL}" was not found.`
     };
   } catch (error) {
     return {
       provider: AI_PROVIDER,
-      model: OLLAMA_MODEL,
+      model: GROQ_MODEL,
       connected: false,
       modelAvailable: false,
       error: error.message
@@ -66,25 +120,49 @@ export async function getLocalAIStatus() {
   }
 }
 
-export async function askGemma(prompt, images = [], systemPrompt = RECEIPT_SYSTEM_PROMPT) {
-  const status = await getLocalAIStatus();
-  if (!status.connected) {
-    throw new Error(status.error);
-  }
-  if (!status.modelAvailable) {
-    throw new Error(
-      `Ollama is running but model "${OLLAMA_MODEL}" is not installed. Run: ollama pull ${OLLAMA_MODEL}`
-    );
+function imageToDataUrl(image) {
+  if (typeof image !== 'string' || !image.trim()) {
+    return null;
   }
 
-  const response = await ollamaRequest('/api/chat', {
+  if (image.startsWith('data:image/')) {
+    return image;
+  }
+
+  return `data:image/jpeg;base64,${image}`;
+}
+
+export async function askGemma(
+  prompt,
+  images = [],
+  systemPrompt = RECEIPT_SYSTEM_PROMPT,
+  {
+    maxTokens = RECEIPT_MAX_TOKENS,
+    fetchImpl = fetch,
+    sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
+    maxRetries = MAX_RATE_LIMIT_RETRIES,
+    logger = console.warn
+  } = {}
+) {
+  const imageContent = images
+    .map(imageToDataUrl)
+    .filter(Boolean)
+    .map(imageUrl => ({
+      type: 'image_url',
+      image_url: { url: imageUrl }
+    }));
+
+  const requestOptions = {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
     timeout: 300000,
+    fetchImpl,
     body: JSON.stringify({
-      model: OLLAMA_MODEL,
-      stream: false,
-      format: 'json',
+      model: GROQ_MODEL,
+      temperature: 0,
+      max_tokens: maxTokens,
+      response_format: {
+        type: 'json_object'
+      },
       messages: [
         {
           role: 'system',
@@ -92,52 +170,99 @@ export async function askGemma(prompt, images = [], systemPrompt = RECEIPT_SYSTE
         },
         {
           role: 'user',
-          content: prompt,
-          ...(images.length ? { images } : {})
+          content: [
+            {
+              type: 'text',
+              text: String(prompt)
+            },
+            ...imageContent
+          ]
         }
-      ],
-      options: { temperature: 0 }
+      ]
     })
-  });
+  };
 
-  const data = await response.json();
-  const content = data.message?.content;
-  if (typeof content !== 'string' || !content.trim()) {
-    throw new Error('Ollama returned an empty response.');
+  let response;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      response = await groqRequest('/chat/completions', requestOptions);
+      break;
+    } catch (error) {
+      if (error.status !== 429 || attempt >= maxRetries) throw error;
+      const delay = groqBackoffDelayMs(attempt, error.retryAfterMs);
+      logger(`Groq rate limited (429); retrying in ${delay} ms (attempt ${attempt + 1} of ${maxRetries}).`);
+      await sleep(delay);
+    }
   }
 
+  const data = await response.json();
+  const content = data.choices?.[0]?.message?.content;
+
+  if (typeof content !== 'string' || !content.trim()) {
+    throw new GroqError('Groq returned an empty response.');
+  }
+
+  const jsonText = content
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/^\s*```(?:json)?\s*|\s*```\s*$/gi, '')
+    .trim();
   try {
-    return JSON.parse(content);
+    return JSON.parse(jsonText);
   } catch {
-    throw new Error('Ollama returned invalid JSON.');
+    throw new GroqError('Groq returned invalid JSON.');
   }
 }
 
 export async function matchProductWithGemma(product, candidate) {
   const prompt = `Compare the purchased product with the retailer product-page evidence below.
+
 Return ONLY JSON with this shape:
 {"equivalent":boolean,"confidence":number,"sameVariant":boolean,"sameCondition":boolean,"reason":"brief evidence-based reason"}
 
-The candidate is a match only when it is the same product, model, size/bundle/variant, and condition. Treat missing or conflicting evidence as false. Do not use the price or retailer URL to infer product identity. Do not invent details.
-Purchased item: ${JSON.stringify({
+The candidate is a match when it is the same base product and any model, variant, and condition printed on the receipt do not conflict with the page. Package size, count, or minor wording differences (for example "AVOCADOS" versus "Avocados, 5 lb bag") are acceptable for generic grocery items when the receipt gives no conflicting size. A different model, flavor, variant, brand, or used/refurbished condition is not a match. Treat conflicting evidence as false. Do not use price or retailer URL to infer product identity. Do not invent details.
+
+Purchased item:
+${JSON.stringify({
     name: product.name || product.product || '',
     brand: product.brand || '',
     model: product.model || '',
-    attributes: product.attributes || product.identityAttributes || []
+    sku: product.sku || '',
+    description: product.description || '',
+    productLineDetails: product.productLineDetails || '',
+    nearbyReceiptText: product.nearbyReceiptText || '',
+    ocrText: product.ocrText || '',
+    quantity: product.quantity ?? null,
+    attributes: product.attributes || product.identityAttributes || [],
+    variant: product.variant || '',
+    size: product.size || '',
+    bundle: product.bundle || '',
+    condition: product.condition || ''
   })}
-Retailer page evidence: ${JSON.stringify({
+
+  Retailer page evidence:
+  ${JSON.stringify({
     title: candidate.title || '',
     brand: candidate.brand || '',
     model: candidate.model || '',
     sku: candidate.sku || '',
-    description: candidate.description || ''
+    description: candidate.description || '',
+    quantity: candidate.quantity ?? null,
+    attributes: candidate.attributes || [],
+    variant: candidate.variant || '',
+    size: candidate.size || '',
+    bundle: candidate.bundle || '',
+    condition: candidate.condition || ''
   })}`;
+
   const parsed = await askGemma(
     prompt,
     [],
-    'You compare product identity using only the supplied evidence. Be conservative: missing, ambiguous, or conflicting model/variant/condition information is not a match. Return valid JSON only.'
+    'You compare product identity using only the supplied evidence. Be conservative: conflicting or ambiguous model, variant, or condition evidence is not a match. Return valid JSON only.',
+    { maxTokens: MATCH_MAX_TOKENS }
   );
+
   const confidence = Number(parsed.confidence);
+
   if (
     typeof parsed.equivalent !== 'boolean' ||
     typeof parsed.sameVariant !== 'boolean' ||
@@ -146,8 +271,9 @@ Retailer page evidence: ${JSON.stringify({
     confidence < 0 ||
     confidence > 1
   ) {
-    throw new Error('Ollama returned an invalid product-match assessment.');
+    throw new Error('Groq returned an invalid product-match assessment.');
   }
+
   return {
     equivalent: parsed.equivalent,
     confidence,
