@@ -21,6 +21,7 @@
     "express": "^4.21.2",
     "googleapis": "^189.0.0",
     "groq-sdk": "^1.6.0",
+    "heic-decode": "^2.1.0",
     "lucide-react": "^0.468.0",
     "multer": "^1.4.5-lts.1",
     "pdfjs-dist": "^4.10.38",

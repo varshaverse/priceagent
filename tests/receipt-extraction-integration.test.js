@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { cp, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -401,6 +401,113 @@ test('receipt uploads call Groq and extract receipt fields from JPG, JPEG, PNG, 
     ]) {
       assert.match(backend.output(), new RegExp(`"event":"${event}"`));
     }
+  } finally {
+    await backend.stop();
+  }
+});
+
+test('HEIC and HEIF uploads are converted and stored as JPEG with the original filename', async () => {
+  const backend = await startBackend();
+  try {
+    const heic = await readFile(path.join(root, 'tests', 'fixtures', 'synthetic-receipt.heic'));
+    const heif = Buffer.from(heic);
+    heif.write('mif1', 8, 'ascii');
+    const formats = [
+      ['receipt.HEIC', 'image/heic', heic],
+      ['receipt.heif', 'image/heif', heif],
+      ['extension.heic', 'application/octet-stream', heic],
+      ['mime-upload', 'image/heif', heif]
+    ];
+
+    for (const [name, mimeType, image] of formats) {
+      const response = await uploadReceipt(backend.port, name, mimeType, image);
+      assert.equal(response.status, 201, `${await response.clone().text()}\n${backend.output()}`);
+      const receipt = await response.json();
+      assert.equal(receipt.extractionStatus, 'complete');
+      assert.equal(receipt.fileName, name);
+      assert.equal(receipt.mimeType, 'image/jpeg');
+      assert.match(receipt.storedFile, /\.jpg$/);
+      const stored = await readFile(path.join(backend.directory, 'data', 'uploads', receipt.storedFile));
+      assert.equal((await sharp(stored).metadata()).format, 'jpeg');
+
+      const request = backend.providerRequests.at(-1);
+      const imagePart = request.messages[1].content.find(part => part.type === 'image_url');
+      const encoded = imagePart.image_url.url.match(/^data:image\/jpeg;base64,(.+)$/);
+      assert.ok(encoded);
+      assert.equal((await sharp(Buffer.from(encoded[1], 'base64')).metadata()).format, 'jpeg');
+    }
+    assert.equal(backend.providerRequests.length, formats.length);
+  } finally {
+    await backend.stop();
+  }
+});
+
+test('corrupt HEIC and HEIF uploads return a clear error without saving or calling Groq', async () => {
+  const backend = await startBackend();
+  try {
+    for (const [name, mimeType] of [['bad.heic', 'image/heic'], ['bad.heif', 'image/heif']]) {
+      const response = await uploadReceipt(backend.port, name, mimeType, Buffer.from('not an image'));
+      assert.equal(response.status, 400);
+      assert.equal((await response.json()).error,
+        'This HEIC receipt could not be converted. Please upload a JPG or PNG version.');
+    }
+    assert.equal(backend.providerRequests.length, 0);
+    assert.deepEqual(await readdir(path.join(backend.directory, 'data', 'uploads')), []);
+    assert.match(backend.output(), /"event":"heif_conversion_failed"/);
+  } finally {
+    await backend.stop();
+  }
+});
+
+test('the 10 MB upload limit still applies before HEIC conversion', async () => {
+  const backend = await startBackend();
+  try {
+    const belowLimit = await uploadReceipt(
+      backend.port, 'invalid.heic', 'image/heic', Buffer.alloc(10 * 1024 * 1024 - 1)
+    );
+    assert.equal(belowLimit.status, 400);
+    assert.equal((await belowLimit.json()).error,
+      'This HEIC receipt could not be converted. Please upload a JPG or PNG version.');
+
+    const aboveLimit = await uploadReceipt(
+      backend.port, 'large.heic', 'image/heic', Buffer.alloc(10 * 1024 * 1024 + 1)
+    );
+    assert.ok(aboveLimit.status >= 400);
+    assert.equal(backend.providerRequests.length, 0);
+    assert.deepEqual(await readdir(path.join(backend.directory, 'data', 'uploads')), []);
+  } finally {
+    await backend.stop();
+  }
+});
+
+test('a provider failure preserves the converted HEIC upload and its JPEG metadata', async () => {
+  const backend = await startBackend({ failProvider: true });
+  try {
+    const image = await readFile(path.join(root, 'tests', 'fixtures', 'synthetic-receipt.heic'));
+    const response = await uploadReceipt(backend.port, 'receipt.HEIC', 'image/heic', image);
+    assert.equal(response.status, 201);
+    const receipt = await response.json();
+    assert.equal(receipt.extractionStatus, 'failed');
+    assert.equal(receipt.fileName, 'receipt.HEIC');
+    assert.equal(receipt.mimeType, 'image/jpeg');
+    assert.match(receipt.storedFile, /\.jpg$/);
+    const stored = await readFile(path.join(backend.directory, 'data', 'uploads', receipt.storedFile));
+    assert.equal((await sharp(stored).metadata()).format, 'jpeg');
+  } finally {
+    await backend.stop();
+  }
+});
+
+test('UTF-8 text receipts continue to reach Groq', async () => {
+  const backend = await startBackend();
+  try {
+    const response = await uploadReceipt(
+      backend.port, 'receipt.txt', 'text/plain', Buffer.from('Costco\nCoffee $12.50\n')
+    );
+    assert.equal(response.status, 201, `${await response.clone().text()}\n${backend.output()}`);
+    assert.equal((await response.json()).extractionStatus, 'complete');
+    assert.equal(backend.providerRequests.length, 1);
+    assert.match(JSON.stringify(backend.providerRequests[0].messages), /Coffee/);
   } finally {
     await backend.stop();
   }

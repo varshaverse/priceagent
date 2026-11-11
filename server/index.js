@@ -26,6 +26,7 @@ import crypto from 'crypto';
 
 import sharp from 'sharp';
 import { renderReceiptPdf } from './receipt-pdf.js';
+import { convertReceiptHeif, HEIF_CONVERSION_ERROR } from './receipt-heif.js';
 
 import {
   candidateUrlRejectionReason,
@@ -2288,16 +2289,30 @@ app.post(
         mimeType: req.file.mimetype,
         byteLength: req.file.size
       }));
+      let receiptFile;
+      try {
+        receiptFile = await convertReceiptHeif(req.file);
+      } catch (error) {
+        console.error('[receipt]', JSON.stringify({
+          event: 'heif_conversion_failed',
+          receiptId,
+          message: sanitizeErrorText(error.message, 'HEIF conversion failed')
+        }));
+        return res.status(400).json({ error: HEIF_CONVERSION_ERROR });
+      }
       const safeName =
         req.file.originalname
           .replace(/[^a-zA-Z0-9._-]/g, '_')
           .slice(-120) || 'receipt';
-      storedFile = `${receiptId}-${safeName}`;
-      await fs.writeFile(path.join(UPLOADS_DIR, storedFile), req.file.buffer);
+      const storedName = receiptFile !== req.file
+        ? `${path.parse(safeName).name || 'receipt'}.jpg`
+        : safeName;
+      storedFile = `${receiptId}-${storedName}`;
+      await fs.writeFile(path.join(UPLOADS_DIR, storedFile), receiptFile.buffer);
 
       let parsed;
       try {
-        parsed = await extractReceipt(req.file, receiptId);
+        parsed = await extractReceipt(receiptFile, receiptId);
       } catch (error) {
         if (!(error instanceof GroqError)) throw error;
 
@@ -2313,7 +2328,7 @@ app.post(
           total: null,
           currency: null,
           fileName: req.file.originalname,
-          mimeType: req.file.mimetype,
+          mimeType: receiptFile.mimetype,
           storedFile,
           uploadedAt: new Date().toISOString(),
           extractionMethod: `Groq (${OLLAMA_MODEL})`,
@@ -2364,7 +2379,7 @@ app.post(
         total: parsed.total,
         currency: parsed.currency,
         fileName: req.file.originalname,
-        mimeType: req.file.mimetype,
+        mimeType: receiptFile.mimetype,
         storedFile,
         uploadedAt,
         extractionMethod: `Groq (${OLLAMA_MODEL})`,
