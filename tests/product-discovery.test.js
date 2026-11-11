@@ -22,6 +22,7 @@ import {
   productPageEvidenceRejectionReason,
   productResultEvidenceRejectionReason,
   readProductLinks,
+  readCostcoWarehousePrice,
   readRetailerProductPage,
   retailerSearchQueries,
   searchRetailerWebsite
@@ -47,6 +48,31 @@ test('public search results provide candidate URLs only, not price evidence', ()
     { url: 'https://shop.example/product/123', title: 'Ninja Crispi FN101' }
   ]);
   assert.equal(Object.hasOwn(results[0], 'price'), false);
+});
+
+test('reads only a clearly labeled Costco warehouse price without unit or discount ambiguity', async t => {
+  try {
+    await access(chromium.executablePath());
+  } catch {
+    t.skip('Playwright Chromium is not installed');
+    return;
+  }
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    for (const [markup, expected] of [
+      ['<div><span>Warehouse Price</span><strong>$1.49</strong></div>', 1.49],
+      ['<div><span>Warehouse Price</span><strong>$1.49 per unit</strong></div>', null],
+      ['<div><span>Warehouse Price</span><strong>$1.49</strong><span>Save $2.00</span></div>', null],
+      ['<div><span>Warehouse Price</span><strong>$1.49</strong></div><div><span>Warehouse Price</span><strong>$9.09</strong></div>', null],
+      ['<div><span>Warehouse Price</span><strong>See price in warehouse</strong></div>', null]
+    ]) {
+      await page.setContent(`<main><h1>Ziploc Variety Pack</h1>${markup}</main>`);
+      assert.deepEqual(await page.evaluate(readCostcoWarehousePrice), { found: true, price: expected });
+    }
+  } finally {
+    await browser.close();
+  }
 });
 
 test('original retailer host matching rejects another seller as an original listing', () => {
@@ -157,6 +183,55 @@ test('Costco no-card search falls back to public search restricted to valid Cost
   ]);
 });
 
+test('Costco walnut discovery searches name and SKU, logs all results, and keeps only official product URLs', async () => {
+  const queries = [];
+  const logs = [];
+  const product = {
+    name: 'KS WALNUTS',
+    sku: '36285',
+    retailer: 'Costco',
+    officialRetailerDomain: 'costco.com',
+    ocrText: '/KS WALNUTS 36285'
+  };
+  const url = 'https://www.costco.com/kirkland-walnuts-36285';
+  const result = await searchRetailerProductPages(
+    'Costco', product,
+    async query => {
+      queries.push(query);
+      return [
+        { url, title: 'Kirkland Signature Walnuts' },
+        { url: 'https://costco.com.evil.example/product/36285', title: 'Walnuts' },
+        { url: 'https://www.costco.com/cart.html', title: 'Cart' }
+      ];
+    },
+    async () => { throw new Error('Public search already found a candidate'); },
+    (_, message) => logs.push(JSON.parse(message))
+  );
+  assert.deepEqual(queries, ['KS WALNUTS 36285 Costco', 'site:costco.com 36285 walnuts']);
+  assert.deepEqual(result.results.map(candidate => candidate.url), [url]);
+  assert.ok(logs.some(entry => entry.candidateUrls?.includes('https://costco.com.evil.example/product/36285')));
+  assert.equal(product.ocrText, '/KS WALNUTS 36285');
+  assert.equal(cleanRetailerSearchText('/TEE 2PK'), 'TEE 2PK');
+  const match = matchProductCandidate(product, {
+    title: 'Kirkland Signature Walnuts', sku: '36285'
+  }, null);
+  assert.equal(match.accepted, true);
+  assert.equal(matchProductCandidate(product, {
+    title: 'KS WALNUTS', sku: '99999'
+  }, null).accepted, false);
+});
+
+test('Costco reports blocked search when all search sources fail or return nothing', async () => {
+  const result = await searchRetailerProductPages(
+    'Costco', { name: 'KS WALNUTS', sku: '36285' },
+    async () => { throw new Error('Search unavailable'); },
+    async () => [],
+    () => {}
+  );
+  assert.deepEqual(result.results, []);
+  assert.equal(result.blocked, true);
+});
+
 test('navigation-only browser results trigger the Costco public-search fallback', async () => {
   let currentUrl = '';
   const page = mockSearchPage({
@@ -232,7 +307,7 @@ test('Costco navigation, search, login, and support URLs are rejected before ran
     'https://www.costco.com/concierge.html',
     'https://www.costco.com/s?keyword=avocado',
     'https://www.costco.com/customer-service.html',
-    'https://www.costco.com/avocado'
+    'https://www.costco.com/'
   ];
   for (const url of rejected) {
     assert.ok(
@@ -248,6 +323,11 @@ test('Costco navigation, search, login, and support URLs are rejected before ran
     ),
     ''
   );
+  assert.equal(candidateUrlRejectionReason(
+    'https://www.costco.com/organic-hass-avocado',
+    'costco.com',
+    'Organic Hass Avocado'
+  ), '');
 });
 
 test('a candidate page needs a title and product-specific evidence', () => {
@@ -319,7 +399,7 @@ test('product discovery scopes each merchant to its own dynamically resolved off
     assert.equal(result.domain, expectedDomain);
     if (expectedDomain.startsWith('northstar')) {
       assert.equal(calls[0], `${retailer} official website`);
-    } else {
+    } else if (expectedDomain !== 'costco.com') {
       assert.equal(calls.length, 0, 'known retailers resolve without a public search');
     }
     assert.deepEqual(websiteCalls.map(call => call.domain), [expectedDomain]);
@@ -345,7 +425,7 @@ test('a single exact retailer match automatically saves its verified URL and liv
   });
   assert.equal(product.url, 'https://www.costco.com/ninja-crispi.html');
   assert.equal(product.originalUrlVerified, true);
-  assert.equal(product.discoveryStatus, 'matched');
+  assert.equal(product.discoveryStatus, 'verified');
   assert.equal(product.currentVerifiedPrice, 20);
   assert.equal(product.currentPrice, 20);
 });
@@ -357,14 +437,14 @@ test('a found retailer URL remains saved before identity or price verification',
     'https://www.costco.com/organic-hass-avocado.html',
     () => {
       assert.equal(product.url, 'https://www.costco.com/organic-hass-avocado.html');
-      assert.equal(product.monitoringStatus, 'URL FOUND');
+      assert.equal(product.discoveryStatus, 'found');
       throw new Error('Temporary live price extraction failure.');
     }
   ), /Temporary live price extraction failure/);
   assert.equal(product.url, 'https://www.costco.com/organic-hass-avocado.html');
   assert.equal(product.originalUrlVerified, false);
   assert.equal(product.discoveryStatus, 'found');
-  assert.equal(product.monitoringStatus, 'URL FOUND');
+  assert.equal(product.discoveryStatus, 'found');
 });
 
 test('discovery builds exact-name, brand/model, SKU, and identifying-detail searches', () => {
@@ -488,7 +568,7 @@ test('retailer search finds an avocado candidate despite a receipt spelling erro
             if (callback.toString().includes('anchor.rel ===')) return [];
             return searchNumber > 0
               ? [{
-                url: 'https://www.costco.com/organic-hass-avocado.html',
+                url: 'https://www.costco.com/organic-hass-avocado.product.123.html',
                 title: 'Organic Hass Avocado',
                 image: true
               }]
@@ -530,13 +610,13 @@ test('retailer search finds an avocado candidate despite a receipt spelling erro
   assert.ok(queries.includes('Organic avacado'));
   assert.equal(queries[0], 'Organic avacado');
   assert.ok(results.some(result =>
-    result.url === 'https://www.costco.com/organic-hass-avocado.html'
+    result.url === 'https://www.costco.com/organic-hass-avocado.product.123.html'
   ));
   assert.ok(logs.some(line => line.includes('"event":"first_valid_product_selected"') &&
-    line.includes('organic-hass-avocado.html')));
+    line.includes('organic-hass-avocado.product.123.html')));
 });
 
-test('browser selects the first matching product card with at least two evidence signals', async () => {
+test('browser returns matching product cards with at least two evidence signals', async () => {
   const logs = [];
   let currentUrl = '';
   const links = [
@@ -601,7 +681,8 @@ test('browser selects the first matching product card with at least two evidence
   });
 
   assert.deepEqual(results.map(result => result.url), [
-    'https://www.costco.com/organic-avocados.product.2.html'
+    'https://www.costco.com/organic-avocados.product.2.html',
+    'https://www.costco.com/avocados-12-count.product.3.html'
   ]);
   assert.ok(logs.some(line => line.includes('costco-app.html') &&
     line.includes('navigation page')));
@@ -1085,5 +1166,6 @@ test('a verified discovery starts retailer price monitoring immediately', async 
     sendNotification: async () => {}
   });
   assert.equal(priceChecks, 1);
-  assert.equal(product.monitoringStatus, 'PRICE DROP DETECTED');
+  assert.equal(product.monitoringStatus, 'ON WATCH');
+  assert.equal(product.priceStatus, 'PRICE DROP DETECTED');
 });

@@ -2,6 +2,7 @@ import axios from 'axios';
 import * as cheerio from 'cheerio';
 import {
   candidateUrlRejectionReason,
+  cleanRetailerSearchText,
   isSuspiciousProductName,
   retailerSearchQueries,
   searchRetailerWebsite
@@ -121,8 +122,7 @@ export function isRetailerDomain(hostname, domain) {
 export function saveVerifiedProductMatch(product, match) {
   product.url = match.url;
   product.originalUrlVerified = true;
-  product.discoveryStatus = 'matched';
-  product.monitoringStatus = 'URL VERIFIED';
+  product.discoveryStatus = 'verified';
   product.matchConfidence = match.matchConfidence ?? match.confidence ?? 0;
   product.matchEvidence = match.matchEvidence || match.reason || '';
   product.currentVerifiedPrice = match.priceVerified ? Number(match.price) : null;
@@ -131,10 +131,12 @@ export function saveVerifiedProductMatch(product, match) {
   return product;
 }
 
-// Best verified listing: prefer entries with a verified price, then the lowest
-// price, then the highest identity confidence.
+// Prefer an exact SKU before comparing verified prices and confidence.
 export function selectBestProductMatch(matches) {
   return [...matches].sort((left, right) => {
+    if (Boolean(left.exactSku) !== Boolean(right.exactSku)) {
+      return left.exactSku ? -1 : 1;
+    }
     const leftPrice = left.priceVerified ? Number(left.price) : Infinity;
     const rightPrice = right.priceVerified ? Number(right.price) : Infinity;
     if (leftPrice !== rightPrice) return leftPrice - rightPrice;
@@ -143,10 +145,12 @@ export function selectBestProductMatch(matches) {
 }
 
 export function saveFoundProductUrl(product, url) {
+  if (product.url !== url || !product.urlSavedAt) {
+    product.urlSavedAt = new Date().toISOString();
+  }
   product.url = url;
   product.originalUrlVerified = false;
   product.discoveryStatus = 'found';
-  product.monitoringStatus = 'URL FOUND';
   product.lastError = null;
   return product;
 }
@@ -227,44 +231,70 @@ export async function searchRetailerProductPages(
   });
 
   let results = [];
-  try {
-    results = inDomain(await searchWebsite({ retailer, domain, product, logger }));
-  } catch (error) {
-    logger('[product-discovery]', JSON.stringify({
-      event: 'retailer_search_failed',
-      retailer,
-      domain,
-      reason: sanitizeErrorText(error.message)
-    }));
-  }
-
-  // A public search engine is used only to find pages on the retailer's own domain.
-  if (!results.length) {
-    const seen = new Map();
-    for (const query of queries.slice(0, 2)) {
+  const isCostco = domain === 'costco.com';
+  const seen = new Map();
+  const publicSearch = async publicQueries => {
+    for (const publicQuery of publicQueries) {
       try {
-        const publicQuery = `site:${domain} ${query}`;
         logger('[product-discovery]', JSON.stringify({
           event: 'public_search_fallback',
           retailer,
           query: publicQuery
         }));
-        for (const result of inDomain(await search(publicQuery, { limit: 8 }))) {
+        const returned = await search(publicQuery, { limit: 8 });
+        logger('[product-discovery]', JSON.stringify({
+          event: 'public_search_results',
+          retailer,
+          query: publicQuery,
+          candidateUrls: returned.map(result => result.url)
+        }));
+        for (const result of inDomain(returned)) {
           if (!seen.has(result.url)) seen.set(result.url, result);
         }
       } catch (error) {
         logger('[product-discovery]', JSON.stringify({
           event: 'public_search_failed',
           retailer,
+          query: publicQuery,
           reason: sanitizeErrorText(error.message)
         }));
       }
-      if (seen.size) break;
+      if (!isCostco && seen.size) break;
     }
-    results = [...seen.values()];
+  };
+  if (isCostco) {
+    const name = cleanRetailerSearchText(product.name || product.product);
+    const sku = cleanRetailerSearchText(product.sku);
+    const keywords = name.replace(/\b(?:ks|kirkland|signature)\b/gi, '').trim().toLowerCase();
+    const publicQueries = sku
+      ? [[name, sku, 'Costco'].filter(Boolean).join(' '),
+        `site:${domain} ${[sku, keywords].filter(Boolean).join(' ')}`]
+      : [`site:${domain} ${name}`];
+    await publicSearch([...new Set(publicQueries)]);
   }
-
-  return { domain, results };
+  if (!seen.size) {
+    try {
+      const returned = await searchWebsite({ retailer, domain, product, logger });
+      logger('[product-discovery]', JSON.stringify({
+        event: 'retailer_search_results',
+        retailer,
+        candidateUrls: returned.map(result => result.url)
+      }));
+      for (const result of inDomain(returned)) seen.set(result.url, result);
+    } catch (error) {
+      logger('[product-discovery]', JSON.stringify({
+        event: 'retailer_search_failed',
+        retailer,
+        domain,
+        reason: sanitizeErrorText(error.message)
+      }));
+    }
+  }
+  if (!isCostco && !seen.size) {
+    await publicSearch(queries.slice(0, 2).map(query => `site:${domain} ${query}`));
+  }
+  results = [...seen.values()];
+  return { domain, results, blocked: isCostco && !results.length };
 }
 
 function normalized(value) {
@@ -339,6 +369,7 @@ export function matchProductCandidate(product, candidate, aiMatch) {
   const sku = normalized(product.sku);
   const candidateSku = normalized(candidate.sku);
   const skuMatches = !sku || sku === candidateSku;
+  const exactSku = Boolean(sku && candidateSku && sku === candidateSku);
   const priceVerified = candidate.verified === true &&
     String(candidate.currency || '').toUpperCase() === 'USD' &&
     Number.isFinite(Number(candidate.price)) &&
@@ -351,14 +382,14 @@ export function matchProductCandidate(product, candidate, aiMatch) {
     confidence >= 0.9;
 
   const aiUnavailable = aiMatch == null;
-  const strongIdentity = titleMatches && brandMatches && (
-    (model && modelMatches) || (sku && candidateSku && skuMatches)
-  );
-  const identityMatches = titleMatches && brandMatches && modelMatches && skuMatches;
+  const strongIdentity = brandMatches && modelMatches &&
+    (exactSku || (titleMatches && model && modelMatches));
+  const identityMatches = (titleMatches || exactSku) && brandMatches && modelMatches && skuMatches;
 
   return {
     accepted: identityMatches &&
       (aiAccepted || (aiUnavailable && Boolean(strongIdentity))),
+    exactSku,
     priceVerified,
     confidence: Number.isFinite(confidence) ? confidence : 0,
     reason: !identityMatches
@@ -439,8 +470,8 @@ export function cheapestVerifiedAlternative(
       Number(offer.price) > 0 &&
       Number.isFinite(Number(product.currentVerifiedPrice)) &&
       Number(offer.price) < Number(product.currentVerifiedPrice) &&
-      product.monitoringStatus !== 'PRICE UNAVAILABLE' &&
-      product.monitoringStatus !== 'WATCH EXPIRED' &&
+      (product.priceStatus || product.monitoringStatus) !== 'PRICE UNAVAILABLE' &&
+      !['WATCH EXPIRED', 'OFF WATCH', 'PURCHASE DATE NEEDS CONFIRMATION'].includes(product.monitoringStatus) &&
       Number.isFinite(originalCheckedAt) &&
       originalCheckedAt <= now.getTime() &&
       now.getTime() - originalCheckedAt <= maxAgeMs &&

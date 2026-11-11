@@ -26,9 +26,6 @@ export function recoverReceiptDate(receipt, now = new Date()) {
     product.date = date;
     product.purchaseDate = date;
     Object.assign(product, dateState);
-    if (dateState.watch === 'yes' && product.originalUrlVerified !== true) {
-      product.nextProductDiscoveryAt = null;
-    }
   }
   return receipt;
 }

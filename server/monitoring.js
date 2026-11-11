@@ -1,3 +1,7 @@
+import { isRetailerDomain, retailerMatchesHost } from './product-discovery.js';
+import { navigationUrlRejectionReason } from './retailer-browser.js';
+import { knownRetailerDomain } from './retailers.js';
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 const MIN_SUPPORTED_YEAR = 1900;
 const MAX_SUPPORTED_YEAR = 2100;
@@ -183,14 +187,14 @@ export function shouldAttemptProductDiscovery(
   requested = false
 ) {
   if (!requested) return false;
-  if (product.originalUrlVerified === true && product.url) return false;
+  if (monitoringStatusFor(product, now) !== 'ON WATCH') return false;
+  if (product.url) return false;
   const retryAt = Date.parse(product.nextProductDiscoveryAt || '');
   return !Number.isFinite(retryAt) || now.getTime() >= retryAt;
 }
 
 export function shouldAutomaticallyDiscoverProduct(product, purchaseDate, now = new Date()) {
-  return watchStatusFor(purchaseDate, now) !== 'WATCH EXPIRED' &&
-    shouldAttemptProductDiscovery(product, now, true);
+  return shouldAttemptProductDiscovery({ ...product, purchaseDate }, now, true);
 }
 
 export function monitoringWindow(purchaseDate) {
@@ -207,6 +211,25 @@ export function monitoringWindow(purchaseDate) {
 }
 
 export function ensureMonitoringMetadata(product, purchaseDate) {
+  for (const field of ['lastError', 'productDiscoveryError', 'discoveryMessage']) {
+    if (['URL does not contain Costco product-page path evidence.',
+      'Product page verification is pending.'].includes(product[field])) {
+      product[field] = field === 'discoveryMessage' && product.url
+        ? 'Product link saved. Product identity is not verified.'
+        : null;
+    }
+    if (product.url && product.lastError ===
+      'Page has no product schema, SKU, add-to-cart control, verified price, or product details.') {
+      product.lastError = null;
+    }
+  }
+  if (product.originalUrlVerified === true && product.url) {
+    product.discoveryStatus = 'verified';
+  }
+  if (!Object.hasOwn(product, 'priceStatus') &&
+    ['PRICE DROP DETECTED', 'PRICE UNAVAILABLE', 'MONITORING'].includes(product.monitoringStatus)) {
+    product.priceStatus = product.monitoringStatus;
+  }
   const window = monitoringWindow(purchaseDate);
   if (window.valid) {
     product.monitoringStartDate = window.startDate;
@@ -286,27 +309,39 @@ export function monitoringStatusFor(product, now = new Date()) {
     product.purchaseDateNeedsConfirmation &&
     product.purchaseDateConfirmedByUser !== true
   ) return 'PURCHASE DATE NEEDS CONFIRMATION';
-  if (isFutureDateOnly(purchaseDate, now) && !product.purchaseDateConfirmed) {
+  if (isFutureDateOnly(purchaseDate, now)) {
     return 'PURCHASE DATE NEEDS CONFIRMATION';
   }
-  const expirationDate = monitoringWindow(purchaseDate).expirationDate;
-  const nowDate = localDateString(now);
-  if (!expirationDate || nowDate >= expirationDate) return 'WATCH EXPIRED';
-  let validVerifiedUrl = false;
+  return isWithinMonitoringWindow(purchaseDate, now) ? 'ON WATCH' : 'OFF WATCH';
+}
+
+export function hasMonitorableUrl(product) {
   try {
     const url = new URL(product.url);
-    validVerifiedUrl = product.originalUrlVerified === true &&
-      ['http:', 'https:'].includes(url.protocol);
+    if (!['http:', 'https:'].includes(url.protocol)) return false;
+    if (product.originalUrlVerified === true) return true;
+    const domain = product.officialRetailerDomain || knownRetailerDomain(product.retailer);
+    return ['found', 'awaiting_url'].includes(product.discoveryStatus) &&
+      Boolean(domain) &&
+      retailerMatchesHost(product.retailer, domain) &&
+      isRetailerDomain(url.hostname, domain) &&
+      !navigationUrlRejectionReason(product.url);
   } catch {
-    validVerifiedUrl = false;
+    return false;
   }
-  if (!validVerifiedUrl) {
+}
+
+export function priceStatusFor(product, now = new Date()) {
+  const watchStatus = monitoringStatusFor(product, now);
+  if (watchStatus !== 'ON WATCH') return watchStatus;
+  const priceStatus = product.priceStatus || product.monitoringStatus;
+  if (!hasMonitorableUrl(product)) {
     if (product.discoveryStatus === 'searching') return 'SEARCHING FOR PRODUCT URL';
     if (product.discoveryStatus === 'found' && product.url) return 'URL FOUND';
     return 'AWAITING PRODUCT URL';
   }
   if (
-    product.monitoringStatus === 'PRICE DROP DETECTED' &&
+    priceStatus === 'PRICE DROP DETECTED' &&
     (
       product.currentVerifiedPrice == null ||
       !Number.isFinite(Number(product.currentVerifiedPrice)) ||
@@ -331,14 +366,15 @@ export function monitoringStatusFor(product, now = new Date()) {
     'SEARCHING FOR PRODUCT URL',
     'URL FOUND',
     'AWAITING PRODUCT URL'
-  ].includes(product.monitoringStatus)
+  ].includes(priceStatus)
     ? 'MONITORING'
-    : product.monitoringStatus || 'MONITORING';
+    : priceStatus === 'ON WATCH' || priceStatus === 'OFF WATCH'
+      ? 'MONITORING' : priceStatus || 'MONITORING';
 }
 
 export function monitoringDashboardStats(products) {
   const validProducts = products.filter(product =>
-    isWithinMonitoringWindow(product.purchaseDate || product.date) &&
+    monitoringStatusFor(product) === 'ON WATCH' &&
     Boolean(product.id) &&
     Boolean(String(product.name || product.product || '').trim()) &&
     Number.isFinite(Number(product.purchasePrice)) &&
@@ -357,13 +393,16 @@ export function monitoringDashboardStats(products) {
   return {
     monitored: validProducts.length,
     withVerifiedUrls: validProducts.filter(hasVerifiedUrl).length,
-    awaitingUrlDiscovery: validProducts.filter(product => !hasVerifiedUrl(product)).length,
+    awaitingUrlDiscovery: products.filter(product =>
+      (validProducts.includes(product) || product.discoveryStatus === 'awaiting_url' ||
+        product.discoveryStatus === 'blocked') && !hasMonitorableUrl(product)
+    ).length,
     pricesUnavailable: validProducts.filter(product =>
-      product.monitoringStatus === 'PRICE UNAVAILABLE'
+      priceStatusFor(product) === 'PRICE UNAVAILABLE'
     ).length,
     priceDropsDetected: validProducts.filter(product =>
-      hasVerifiedUrl(product) &&
-      product.monitoringStatus === 'PRICE DROP DETECTED' &&
+      hasMonitorableUrl(product) &&
+      priceStatusFor(product) === 'PRICE DROP DETECTED' &&
       product.currentVerifiedPrice != null &&
       Number.isFinite(Number(product.currentVerifiedPrice)) &&
       Number(product.currentVerifiedPrice) < Number(product.purchasePrice) &&
@@ -407,15 +446,17 @@ export async function checkMonitoredProduct({
   sendNotification,
   persist
 }) {
+  intervalMs = Math.max(Number(intervalMs) || 0, DAY_MS);
   ensureMonitoringMetadata(product, purchaseDate);
   const timestamp = now.toISOString();
   const expirationDate = monitoringWindow(purchaseDate).expirationDate;
   const today = localDateString(now);
   product.monitoringStartDate ||= purchaseDate;
+  product.monitoringStatus = monitoringStatusFor({ ...product, purchaseDate }, now);
 
   if (!isValidDateOnly(purchaseDate)) {
     product.purchaseDateNeedsConfirmation = true;
-    product.monitoringStatus = 'PURCHASE DATE NEEDS CONFIRMATION';
+    product.priceStatus = null;
     product.nextCheckAt = null;
     return { status: product.monitoringStatus, checked: false };
   }
@@ -424,66 +465,88 @@ export async function checkMonitoredProduct({
     product.purchaseDateNeedsConfirmation &&
     product.purchaseDateConfirmedByUser !== true
   ) {
-    product.monitoringStatus = 'PURCHASE DATE NEEDS CONFIRMATION';
+    product.priceStatus = null;
     product.nextCheckAt = null;
     return { status: product.monitoringStatus, checked: false };
   }
 
-  if (isFutureDateOnly(purchaseDate, now) && !product.purchaseDateConfirmed) {
+  if (isFutureDateOnly(purchaseDate, now)) {
     product.purchaseDateNeedsConfirmation = true;
-    product.monitoringStatus = 'PURCHASE DATE NEEDS CONFIRMATION';
+    product.priceStatus = null;
     product.nextCheckAt = null;
     return { status: product.monitoringStatus, checked: false };
   }
 
   product.purchaseDateNeedsConfirmation = false;
-  if (today < purchaseDate) {
-    product.monitoringStatus = 'MONITORING';
-    product.nextCheckAt = new Date(
-      `${purchaseDate}T00:00:00`
-    ).toISOString();
-    return { status: product.monitoringStatus, checked: false };
-  }
-
   if (product.monitoringStartDate && today < product.monitoringStartDate) {
-    product.monitoringStatus = 'MONITORING';
+    product.priceStatus = 'MONITORING';
     product.nextCheckAt = nextCheckAt(timestamp, intervalMs);
     return { status: product.monitoringStatus, checked: false };
   }
 
   if (!expirationDate || today >= expirationDate) {
-    product.monitoringStatus = 'WATCH EXPIRED';
+    product.priceStatus = null;
     product.nextCheckAt = null;
     return { status: product.monitoringStatus, checked: false };
   }
 
   if (!Number.isFinite(Number(product.purchasePrice)) || Number(product.purchasePrice) <= 0) {
-    product.lastCheckedAt = timestamp;
-    product.monitoringStatus = 'PRICE UNAVAILABLE';
+    product.priceStatus = 'PRICE UNAVAILABLE';
     product.lastError = 'A valid original purchase price is required for price-drop detection.';
     product.nextCheckAt = nextCheckAt(timestamp, intervalMs);
-    return { status: product.monitoringStatus, checked: true, reason: product.lastError };
+    return { status: product.priceStatus, checked: true, reason: product.lastError };
   }
 
   if (!product.url) {
-    product.monitoringStatus = product.discoveryStatus === 'searching'
+    product.priceStatus = product.discoveryStatus === 'searching'
       ? 'SEARCHING FOR PRODUCT URL'
       : 'AWAITING PRODUCT URL';
     product.nextCheckAt = product.nextProductDiscoveryAt || null;
-    return { status: product.monitoringStatus, checked: true, reason: product.lastError };
+    return { status: product.priceStatus, checked: true, reason: product.lastError };
   }
 
-  if (product.originalUrlVerified !== true) {
-    product.monitoringStatus = product.discoveryStatus === 'found' && product.url
+  if (!hasMonitorableUrl(product)) {
+    product.priceStatus = product.discoveryStatus === 'found' && product.url
       ? 'URL FOUND'
       : 'AWAITING PRODUCT URL';
     product.nextCheckAt = product.nextProductDiscoveryAt || null;
-    return { status: product.monitoringStatus, checked: false, reason: product.lastError };
+    return { status: product.priceStatus, checked: false, reason: product.lastError };
   }
 
+  if (product.originalUrlVerified !== true) {
+    product.urlSavedAt ||= product.lastProductDiscoveryAt || timestamp;
+    const savedTime = Date.parse(product.urlSavedAt);
+    if (!Number.isFinite(savedTime)) {
+      product.urlSavedAt = timestamp;
+    }
+    if (localDateString(new Date(product.urlSavedAt)) >= today) {
+      product.priceStatus = 'MONITORING';
+      product.nextCheckAt = nextCheckAt(product.urlSavedAt, intervalMs);
+      return { status: product.priceStatus, checked: false, reason: 'Saved link will be checked on the next day.' };
+    }
+  }
+
+  const lastAttempt = product.lastPriceCheckAttemptAt || product.lastCheckedAt;
+  const lastAttemptTime = Date.parse(lastAttempt || '');
+  if (Number.isFinite(lastAttemptTime)) {
+    const earliest = lastAttemptTime + intervalMs;
+    if (localDateString(new Date(lastAttemptTime)) === today ||
+      intervalMs > DAY_MS && now.getTime() < earliest) {
+      product.nextCheckAt = new Date(earliest).toISOString();
+      return { status: priceStatusFor(product, now), checked: false, reason: 'Daily price check already completed or scheduled.' };
+    }
+  }
+  product.lastPriceCheckAttemptAt = timestamp;
+  product.nextCheckAt = nextCheckAt(timestamp, intervalMs);
+  await persist?.();
+
   const clearCurrentObservation = () => {
+    if (Number.isFinite(Number(product.currentVerifiedPrice)) && Number(product.currentVerifiedPrice) > 0) {
+      product.previousVerifiedPrice = Number(product.currentVerifiedPrice);
+    }
     product.currentVerifiedPrice = null;
     product.currentPrice = null;
+    product.currentPriceSource = null;
     product.potentialSavings = null;
     product.savingsPercent = null;
   };
@@ -494,10 +557,10 @@ export async function checkMonitoredProduct({
   } catch (error) {
     product.lastCheckedAt = timestamp;
     clearCurrentObservation();
-    product.monitoringStatus = 'PRICE UNAVAILABLE';
+    product.priceStatus = 'PRICE UNAVAILABLE';
     product.lastError = `The retailer price could not be verified: ${error.message}`;
     product.nextCheckAt = nextCheckAt(timestamp, intervalMs);
-    return { status: product.monitoringStatus, checked: true, reason: product.lastError };
+    return { status: product.priceStatus, checked: true, reason: product.lastError };
   }
 
   const price = Number(observation?.price);
@@ -509,10 +572,10 @@ export async function checkMonitoredProduct({
   ) {
     product.lastCheckedAt = timestamp;
     clearCurrentObservation();
-    product.monitoringStatus = 'PRICE UNAVAILABLE';
+    product.priceStatus = 'PRICE UNAVAILABLE';
     product.lastError = 'The retailer did not provide a verified price.';
     product.nextCheckAt = nextCheckAt(timestamp, intervalMs);
-    return { status: product.monitoringStatus, checked: true, reason: product.lastError };
+    return { status: product.priceStatus, checked: true, reason: product.lastError };
   }
 
   const purchasePrice = Number(product.purchasePrice);
@@ -522,18 +585,14 @@ export async function checkMonitoredProduct({
   product.previousVerifiedPrice = Number.isFinite(previous) ? previous : null;
   product.currentVerifiedPrice = price;
   product.currentPrice = price;
+  product.currentPriceSource = observation.priceSource || null;
   product.lastCheckedAt = timestamp;
   product.lastError = null;
   if (typeof observation === 'object' && observation.imageUrl) {
     product.imageUrl = observation.imageUrl;
   }
-  product.originalUrlVerified = true;
-
-  const lastSnapshot = product.priceHistory.at(-1);
-  if (!lastSnapshot || Number(lastSnapshot.price) !== price) {
-    product.priceHistory.push({ price, checkedAt: timestamp, verified: true });
-    product.priceHistory = product.priceHistory.slice(-1000);
-  }
+  product.priceHistory.push({ price, checkedAt: timestamp, verified: true, source: product.currentPriceSource });
+  product.priceHistory = product.priceHistory.slice(-1000);
   product.lowestVerifiedPrice = product.lowestVerifiedPrice == null
     ? price
     : Math.min(Number(product.lowestVerifiedPrice), price);
@@ -547,18 +606,17 @@ export async function checkMonitoredProduct({
   product.nextCheckAt = nextCheckAt(timestamp, intervalMs);
 
   if (price >= purchasePrice) {
-    product.monitoringStatus = 'MONITORING';
-    return { status: product.monitoringStatus, checked: true, price };
+    product.priceStatus = 'MONITORING';
+    return { status: product.priceStatus, checked: true, price };
   }
 
-  product.monitoringStatus = 'PRICE DROP DETECTED';
+  product.priceStatus = 'PRICE DROP DETECTED';
   product.priceDropDetectedAt ||= timestamp;
   product.firstPriceDropAt ||= timestamp;
   product.priceDropSavings = purchasePrice - price;
   product.priceDropSavingsPercent = (product.priceDropSavings / purchasePrice) * 100;
 
   const sentPrices = product.notificationHistory
-    .filter(item => item.status === 'sent')
     .map(item => Number(item.price))
     .filter(value => Number.isFinite(value) && value > 0);
   const legacyLastSentPrice = Number(product.lastAlertedPrice);
@@ -573,11 +631,17 @@ export async function checkMonitoredProduct({
   );
   const qualifies = !sentPrices.includes(price);
   if (!qualifies || deliveryInProgress) {
-    return { status: product.monitoringStatus, checked: true, price, notification: 'duplicate_suppressed' };
+    return { status: product.priceStatus, checked: true, price, notification: 'duplicate_suppressed' };
   }
 
   const notification = {
     status: 'pending',
+    productName: product.name || product.product || '',
+    retailer: product.retailer || '',
+    purchasePrice,
+    url: product.url,
+    productIdentityVerified: product.originalUrlVerified === true,
+    priceSource: product.currentPriceSource,
     price,
     detectedAt: timestamp,
     savings: product.priceDropSavings,
@@ -590,6 +654,7 @@ export async function checkMonitoredProduct({
   notification.status = 'sending';
   product.notificationStatus = 'sending';
   await persist?.();
+  let sendError;
   try {
     await sendNotification(product, {
       price,
@@ -597,21 +662,24 @@ export async function checkMonitoredProduct({
       savingsPercent: product.priceDropSavingsPercent,
       detectedAt: timestamp
     });
-    notification.status = 'sent';
-    notification.sentAt = new Date().toISOString();
-    product.notificationStatus = 'sent';
-    product.notificationCount += 1;
-    product.lastAlertedPrice = price;
-    product.alertedPrices = [...new Set([...(product.alertedPrices || []), price])];
-    product.alertSent = true;
-    await persist?.();
-    return { status: product.monitoringStatus, checked: true, price, notification: 'sent' };
   } catch (error) {
-    notification.status = 'failed';
-    notification.error = error.message;
-    product.notificationStatus = 'failed';
-    product.lastError = `Price drop detected, but the notification could not be sent: ${error.message}`;
-    await persist?.();
-    return { status: product.monitoringStatus, checked: true, price, notification: 'failed', reason: error.message };
+    sendError = error;
   }
+  if (sendError) {
+    notification.status = 'failed';
+    notification.error = sendError.message;
+    product.notificationStatus = 'failed';
+    product.lastError = `Price drop detected, but the notification could not be sent: ${sendError.message}`;
+    await persist?.();
+    return { status: product.priceStatus, checked: true, price, notification: 'failed', reason: sendError.message };
+  }
+  notification.status = 'sent';
+  notification.sentAt = new Date().toISOString();
+  product.notificationStatus = 'sent';
+  product.notificationCount += 1;
+  product.lastAlertedPrice = price;
+  product.alertedPrices = [...new Set([...(product.alertedPrices || []), price])];
+  product.alertSent = true;
+  await persist?.();
+  return { status: product.priceStatus, checked: true, price, notification: 'sent' };
 }

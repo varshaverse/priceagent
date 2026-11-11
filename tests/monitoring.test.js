@@ -5,12 +5,14 @@ import path from 'node:path';
 import test from 'node:test';
 import {
   checkMonitoredProduct,
+  ensureMonitoringMetadata,
   isFutureDateOnly,
   isValidDateOnly,
   isWithinMonitoringWindow,
   localDateString,
   monitoringDashboardStats,
   monitoringStatusFor,
+  priceStatusFor,
   monitoringWindow,
   normalizeReceiptDate,
   receiptDateFromEvidence,
@@ -22,7 +24,34 @@ import {
 } from '../server/monitoring.js';
 
 const now = new Date('2026-11-04T12:00:00.000Z');
-const intervalMs = 60 * 60 * 1000;
+const intervalMs = 24 * 60 * 60 * 1000;
+
+test('obsolete Costco path error is replaced without marking a URL verified', () => {
+  const product = {
+    url: 'https://www.costco.com/walnuts',
+    originalUrlVerified: false,
+    lastError: 'URL does not contain Costco product-page path evidence.',
+    productDiscoveryError: 'URL does not contain Costco product-page path evidence.',
+    discoveryMessage: 'URL does not contain Costco product-page path evidence.'
+  };
+  ensureMonitoringMetadata(product, null);
+  assert.equal(product.lastError, null);
+  assert.equal(product.productDiscoveryError, null);
+  assert.equal(product.discoveryMessage, 'Product link saved. Product identity is not verified.');
+  assert.equal(product.originalUrlVerified, false);
+});
+
+test('a saved link is not rediscovered even when product identity is unverified', () => {
+  const product = {
+    purchaseDate: '2026-11-01',
+    url: 'https://www.costco.com/walnuts',
+    originalUrlVerified: false,
+    lastError: 'Page has no product schema, SKU, add-to-cart control, verified price, or product details.'
+  };
+  ensureMonitoringMetadata(product, product.purchaseDate);
+  assert.equal(product.lastError, null);
+  assert.equal(shouldAttemptProductDiscovery(product, now, true), false);
+});
 
 function makeProduct(overrides = {}) {
   return {
@@ -69,10 +98,10 @@ test('a product without a verified original URL cannot be a price drop', async (
       sendNotification: async () => { sendCount++; }
     });
     assert.equal(result.status, 'AWAITING PRODUCT URL');
-    assert.equal(product.monitoringStatus, 'AWAITING PRODUCT URL');
+    assert.equal(product.monitoringStatus, 'ON WATCH');
     assert.equal(fetchCount, 0);
     assert.equal(sendCount, 0);
-    assert.equal(monitoringStatusFor(product, now), 'AWAITING PRODUCT URL');
+    assert.equal(priceStatusFor(product, now), 'AWAITING PRODUCT URL');
 });
 
 test('a found retailer URL remains visible while identity or price verification retries', async () => {
@@ -94,8 +123,85 @@ test('a found retailer URL remains visible while identity or price verification 
     sendNotification: async () => {}
   });
   assert.equal(result.status, 'URL FOUND');
-  assert.equal(monitoringStatusFor(product, now), 'URL FOUND');
+  assert.equal(priceStatusFor(product, now), 'URL FOUND');
+  assert.equal(monitoringStatusFor(product, now), 'ON WATCH');
   assert.equal(fetchCount, 0);
+});
+
+test('a saved official URL waits until the next day, then checks and alerts without claiming identity verification', async () => {
+  const product = makeProduct({
+    name: 'KS WALNUTS',
+    retailer: 'Costco',
+    officialRetailerDomain: 'costco.com',
+    url: 'https://www.costco.com/walnuts',
+    urlSavedAt: now.toISOString(),
+    originalUrlVerified: false,
+    discoveryStatus: 'found'
+  });
+  let fetchCount = 0;
+  let notifications = 0;
+  const run = checkTime => checkMonitoredProduct({
+    product, now: checkTime, intervalMs,
+    fetchVerifiedPrice: async () => {
+      fetchCount++;
+      return { price: 80, currency: 'USD', verified: true };
+    },
+    sendNotification: async () => { notifications++; }
+  });
+  const first = await run(now);
+  assert.equal(first.checked, false);
+  assert.equal(fetchCount, 0);
+  assert.equal(product.nextCheckAt, new Date(now.getTime() + intervalMs).toISOString());
+  const tomorrow = new Date(now.getTime() + intervalMs);
+  const checked = await run(tomorrow);
+  assert.equal(checked.notification, 'sent');
+  assert.equal(fetchCount, 1);
+  assert.equal(notifications, 1);
+  assert.equal(product.originalUrlVerified, false);
+  assert.equal(product.discoveryStatus, 'found');
+  assert.equal(product.notificationHistory[0].productIdentityVerified, false);
+  assert.equal(priceStatusFor(product, tomorrow), 'PRICE DROP DETECTED');
+  assert.equal(monitoringDashboardStats([{
+    ...product,
+    purchaseDate: localDateString(new Date()),
+    date: localDateString(new Date())
+  }]).priceDropsDetected, 1);
+  assert.equal((await run(tomorrow)).checked, false);
+  assert.equal(fetchCount, 1);
+});
+
+test('saved links from other retailers and navigation pages are never monitored', async () => {
+  for (const url of ['https://other.example/product/1', 'https://www.costco.com/cart.html']) {
+    const product = makeProduct({
+      retailer: 'Costco', officialRetailerDomain: 'costco.com', url,
+      urlSavedAt: new Date(now.getTime() - intervalMs).toISOString(),
+      originalUrlVerified: false, discoveryStatus: 'found'
+    });
+    let fetched = false;
+    await checkMonitoredProduct({
+      product, now, intervalMs,
+      fetchVerifiedPrice: async () => { fetched = true; },
+      sendNotification: async () => {}
+    });
+    assert.equal(fetched, false, url);
+  }
+});
+
+test('saved unverified links do not bypass purchase-date or watch-window restrictions', async () => {
+  for (const date of [null, '2026-09-01']) {
+    const product = makeProduct({
+      retailer: 'Costco', officialRetailerDomain: 'costco.com',
+      url: 'https://www.costco.com/walnuts', urlSavedAt: '2026-11-02T12:00:00Z',
+      originalUrlVerified: false, discoveryStatus: 'found', purchaseDate: date, date
+    });
+    let fetched = false;
+    await checkMonitoredProduct({
+      product, now, intervalMs,
+      fetchVerifiedPrice: async () => { fetched = true; },
+      sendNotification: async () => {}
+    });
+    assert.equal(fetched, false);
+  }
 });
 
 test('a verified retailer URL is exposed as URL VERIFIED until price monitoring runs', () => {
@@ -103,7 +209,8 @@ test('a verified retailer URL is exposed as URL VERIFIED until price monitoring 
     discoveryStatus: 'matched',
     monitoringStatus: 'URL VERIFIED'
   });
-  assert.equal(monitoringStatusFor(product, now), 'URL VERIFIED');
+  assert.equal(priceStatusFor(product, now), 'URL VERIFIED');
+  assert.equal(monitoringStatusFor(product, now), 'ON WATCH');
 });
 
 test('a stale drop status without a verified current price is unavailable and not counted', () => {
@@ -113,7 +220,7 @@ test('a stale drop status without a verified current price is unavailable and no
       currentPrice: 1,
       lastCheckedAt: now.toISOString()
     });
-    assert.equal(monitoringStatusFor(product, now), 'PRICE UNAVAILABLE');
+    assert.equal(priceStatusFor(product, now), 'PRICE UNAVAILABLE');
     assert.equal(monitoringDashboardStats([product]).priceDropsDetected, 0);
 });
 
@@ -172,7 +279,7 @@ test('future purchase dates are not monitored until confirmed and use local cale
       fetchVerifiedPrice: async () => { fetchCount++; return { price: 80, currency: 'USD', verified: true }; },
       sendNotification: async () => {}
     });
-    assert.equal(waiting.status, 'MONITORING');
+    assert.equal(waiting.status, 'PURCHASE DATE NEEDS CONFIRMATION');
     assert.equal(waiting.checked, false);
     assert.equal(fetchCount, 0);
   assert.equal(product.monitoringStartDate, '2026-11-05');
@@ -263,7 +370,7 @@ test('a valid printed date controls status regardless of when the image was uplo
     }
   });
 
-  test('product URL discovery is immediately eligible regardless of date confirmation', () => {
+  test('product URL discovery requires a clear date within the watch window', () => {
     const now = new Date('2026-11-08T12:00:00-08:00');
     for (const purchaseDate of [null, '2026-11-06', '2026-11-09']) {
       assert.equal(shouldAttemptProductDiscovery({
@@ -271,7 +378,7 @@ test('a valid printed date controls status regardless of when the image was uplo
         purchaseDateNeedsConfirmation: !purchaseDate || purchaseDate === '2026-11-09',
         url: '',
         originalUrlVerified: false
-      }, now, true), true);
+      }, now, true), purchaseDate === '2026-11-06');
     }
     assert.equal(shouldAttemptProductDiscovery({
       url: 'https://store.example/item',
@@ -284,6 +391,7 @@ test('a valid printed date controls status regardless of when the image was uplo
     assert.equal(shouldAttemptProductDiscovery({
       url: '',
       originalUrlVerified: false,
+      purchaseDate: '2026-11-06',
       nextProductDiscoveryAt: '2026-11-09T12:00:00.000Z'
     }, now, true), false);
   });
@@ -298,11 +406,11 @@ test('a valid printed date controls status regardless of when the image was uplo
     },
     sendNotification: async () => {}
   });
-  assert.equal(result.status, 'WATCH EXPIRED');
+  assert.equal(result.status, 'OFF WATCH');
   assert.equal(product.nextCheckAt, null);
   assert.equal(fetchCount, 0);
 
-  assert.equal(monitoringStatusFor(product, now), 'WATCH EXPIRED');
+  assert.equal(monitoringStatusFor(product, now), 'OFF WATCH');
 });
 
 test('a November 6 purchase remains WATCH on November 8 using date-only arithmetic', async () => {
@@ -331,6 +439,30 @@ test('a November 6 purchase remains WATCH on November 8 using date-only arithmet
 test('missing purchase dates require confirmation and purchases past the window expire', () => {
   assert.equal(watchStatusFor(null, now), 'PURCHASE DATE NEEDS CONFIRMATION');
   assert.equal(watchStatusFor('2026-10-04', now), 'WATCH EXPIRED');
+});
+
+test('watch status is independent of discovery and price status', async () => {
+  for (const [date, expected] of [
+    [null, 'PURCHASE DATE NEEDS CONFIRMATION'],
+    ['2026-11-01', 'ON WATCH'],
+    ['2026-10-01', 'OFF WATCH']
+  ]) {
+    const product = makeProduct({
+      purchaseDate: date, date,
+      discoveryStatus: 'matched',
+      priceStatus: 'PRICE DROP DETECTED'
+    });
+    assert.equal(monitoringStatusFor(product, now), expected);
+  }
+  const ambiguous = makeProduct({ purchaseDateNeedsConfirmation: true });
+  let fetched = false;
+  const result = await checkMonitoredProduct({
+    product: ambiguous, now, intervalMs,
+    fetchVerifiedPrice: async () => { fetched = true; },
+    sendNotification: async () => {}
+  });
+  assert.equal(result.status, 'PURCHASE DATE NEEDS CONFIRMATION');
+  assert.equal(fetched, false);
 });
 
 test('dashboard statistics count valid records, verified URLs, unavailable prices, and only verified drops', () => {
@@ -378,6 +510,20 @@ test('dashboard statistics count valid records, verified URLs, unavailable price
     });
 });
 
+test('dashboard counts awaiting and blocked discovery even without a confirmed purchase date', () => {
+  const products = [
+    { id: 'a', name: 'KS WALNUTS', discoveryStatus: 'awaiting_url', date: null },
+    { id: 'b', name: 'Other', discoveryStatus: 'blocked', date: null },
+    { id: 'c', name: 'Verified', discoveryStatus: 'awaiting_url', originalUrlVerified: true, url: 'https://costco.com/product/1' }
+  ];
+  assert.equal(monitoringDashboardStats(products).awaitingUrlDiscovery, 2);
+});
+
+test('dashboard does not count unconfirmed purchases as monitored', () => {
+  const product = makeProduct({ purchaseDateNeedsConfirmation: true });
+  assert.equal(monitoringDashboardStats([product]).monitored, 0);
+});
+
 test('verified price above purchase price records no drop and sends no email', async () => {
   const product = makeProduct();
   let sendCount = 0;
@@ -411,6 +557,84 @@ test('verified price below purchase price records savings and notifies automatic
   assert.equal(product.notificationCount, 1);
   assert.equal(notification.details.price, 80);
   assert.equal(product.notificationHistory[0].status, 'sent');
+  assert.deepEqual(
+    Object.fromEntries(['productName', 'retailer', 'purchasePrice', 'price', 'savings', 'savingsPercent', 'url', 'detectedAt']
+      .map(key => [key, product.notificationHistory[0][key]])),
+    { productName: 'Test item', retailer: 'Example Retailer', purchasePrice: 100,
+      price: 80, savings: 20, savingsPercent: 20, url: product.url, detectedAt: now.toISOString() }
+  );
+});
+
+test('a Costco warehouse price below the purchase price creates a labeled notification', async () => {
+  const product = makeProduct({ name: 'ZIPLK VTY PK', retailer: 'Costco', purchasePrice: 9.09 });
+  const result = await checkMonitoredProduct({
+    product, now, intervalMs,
+    fetchVerifiedPrice: async () => ({
+      price: 1.49, currency: 'USD', verified: true, priceSource: 'Costco warehouse price'
+    }),
+    sendNotification: async () => {}
+  });
+  assert.equal(result.notification, 'sent');
+  assert.equal(product.currentVerifiedPrice, 1.49);
+  assert.equal(product.notificationHistory[0].priceSource, 'Costco warehouse price');
+  assert.equal(product.priceHistory[0].source, 'Costco warehouse price');
+});
+
+test('only one price attempt per day survives manual runs, failures, and reloads', async () => {
+  const product = makeProduct();
+  let fetchCount = 0;
+  const run = (item, checkTime, fail = false) => checkMonitoredProduct({
+    product: item,
+    now: checkTime,
+    intervalMs: 60 * 60 * 1000,
+    fetchVerifiedPrice: async () => {
+      fetchCount++;
+      if (fail) throw new Error('HTTP 503');
+      return { price: 100, currency: 'USD', verified: true };
+    },
+    sendNotification: async () => {},
+    persist: async () => {}
+  });
+  assert.equal((await run(product, now, true)).checked, true);
+  const reloaded = JSON.parse(JSON.stringify(product));
+  assert.equal((await run(reloaded, new Date(now.getTime() + 60 * 60 * 1000))).checked, false);
+  assert.equal(fetchCount, 1);
+  assert.equal((await run(reloaded, new Date(now.getTime() + intervalMs))).checked, true);
+  assert.equal(fetchCount, 2);
+});
+
+test('overlapping checks reserve the daily attempt before fetching', async () => {
+  const product = makeProduct();
+  let releaseFetch;
+  let fetchCount = 0;
+  const options = {
+    product, now, intervalMs,
+    fetchVerifiedPrice: async () => {
+      fetchCount++;
+      await new Promise(resolve => { releaseFetch = resolve; });
+      return { price: 100, currency: 'USD', verified: true };
+    },
+    sendNotification: async () => {},
+    persist: async () => {}
+  };
+  const first = checkMonitoredProduct(options);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal((await checkMonitoredProduct(options)).checked, false);
+  releaseFetch();
+  assert.equal((await first).checked, true);
+  assert.equal(fetchCount, 1);
+});
+
+test('a later calendar day allows a check even if less than 24 hours elapsed', async () => {
+  const late = new Date(2026, 10, 4, 23, 30);
+  const product = makeProduct({ lastPriceCheckAttemptAt: new Date(2026, 10, 3, 22, 30).toISOString() });
+  const result = await check(product, { price: 100, now: late });
+  assert.equal(result.checked, true);
+  const duplicate = await check(product, { price: 90, now: new Date(2026, 10, 4, 23, 45) });
+  assert.equal(duplicate.checked, false);
+  const followingDay = await check(product, { price: 100, now: new Date(2026, 10, 5, 0, 5) });
+  assert.equal(followingDay.checked, true);
+  assert.equal(product.priceHistory.length, 2);
 });
 
 test('a verified $20 price against a $50 purchase triggers a $30 price drop', async () => {
@@ -468,7 +692,7 @@ test('expired monitoring period does not fetch or notify', async () => {
     fetchVerifiedPrice: async () => { fetchCount++; return { price: 50, currency: 'USD', verified: true }; },
     sendNotification: async () => { sendCount++; }
   });
-  assert.equal(result.status, 'WATCH EXPIRED');
+  assert.equal(result.status, 'OFF WATCH');
   assert.equal(product.monitoringExpirationDate, '2026-10-31');
   assert.equal(product.nextCheckAt, null);
   assert.equal(fetchCount, 0);
@@ -487,7 +711,7 @@ test('day 29 is still on watch and day 30 is expired and never fetched', async (
   });
   assert.equal((await run('2026-10-06')).status, 'MONITORING');
   assert.equal(fetchCount, 1);
-  assert.equal((await run('2026-10-05')).status, 'WATCH EXPIRED');
+  assert.equal((await run('2026-10-05')).status, 'OFF WATCH');
   assert.equal(fetchCount, 1);
   assert.equal(watchStatusFor('2026-10-06', today), 'WATCH');
   assert.equal(watchStatusFor('2026-10-05', today), 'WATCH EXPIRED');
@@ -525,16 +749,18 @@ test('a successful automatic notification is persisted as sent through the injec
     fetchVerifiedPrice: async () => ({ price: 60, currency: 'USD', verified: true }),
     sendNotification: async (_, details) => {
       assert.equal(details.savings, 40);
+      assert.equal(product.notificationHistory[0].status, 'sending');
+      assert.equal(persisted.at(-1), 'sending');
     },
     persist: async () => persisted.push(product.notificationStatus)
   });
   assert.equal(result.notification, 'sent');
-  assert.deepEqual(persisted, ['pending', 'sending', 'sent']);
+  assert.deepEqual(persisted, [undefined, 'pending', 'sending', 'sent']);
   assert.equal(product.notificationHistory[0].status, 'sent');
   assert.ok(product.notificationHistory[0].sentAt);
 });
 
-test('a failed notification remains retryable on the next scheduled check', async () => {
+test('a failed email is recorded as a dashboard notification and is not retried at the same price', async () => {
   const product = makeProduct();
   let sendCount = 0;
   const failed = await check(product, {
@@ -545,14 +771,17 @@ test('a failed notification remains retryable on the next scheduled check', asyn
     }
   });
   assert.equal(failed.notification, 'failed');
+  assert.equal(product.notificationHistory[0].price, 75);
+  assert.equal(product.notificationHistory[0].url, product.url);
   const retried = await check(product, {
     price: 75,
     now: new Date(now.getTime() + intervalMs),
     send: async () => { sendCount++; }
   });
-  assert.equal(retried.notification, 'sent');
-  assert.equal(sendCount, 2);
-  assert.deepEqual(product.notificationHistory.map(item => item.status), ['failed', 'sent']);
+  assert.equal(retried.notification, 'duplicate_suppressed');
+  assert.equal(sendCount, 1);
+  assert.deepEqual(product.notificationHistory.map(item => item.status), ['failed']);
+  assert.match(product.notificationHistory[0].error, /mock Gmail failure/);
 });
 
 test('same-price notifications are suppressed but every changed lower price can notify', async () => {

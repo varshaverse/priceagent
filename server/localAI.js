@@ -1,15 +1,26 @@
-import 'dotenv/config';
+import './env.js';
+import Groq from 'groq-sdk';
 
 const AI_PROVIDER = 'groq';
 
-const GROQ_URL = (
-  process.env.GROQ_URL || 'https://api.groq.com/openai/v1'
-).replace(/\/+$/, '');
+function normalizeGroqApiKey(value) {
+  return (typeof value === 'string' ? value : '')
+    .trim()
+    .replace(/^['"]+|['"]+$/g, '')
+    .trim();
+}
 
-const GROQ_API_KEY = (process.env.GROQ_API_KEY || '').trim();
+const GROQ_API_KEY = normalizeGroqApiKey(process.env.GROQ_API_KEY);
 
-const GROQ_MODEL =
-  process.env.GROQ_MODEL || 'qwen/qwen3.8-27b';
+export function loadGroqApiKey(value = GROQ_API_KEY) {
+  const key = normalizeGroqApiKey(value);
+  if (!key.startsWith('gsk_')) {
+    throw new Error('GROQ_API_KEY is not set or valid');
+  }
+  return key;
+}
+
+const GROQ_MODEL = 'qwen/qwen3.8-27b';
 
 // This export name is kept for compatibility with the existing server/index.js.
 const OLLAMA_MODEL = GROQ_MODEL;
@@ -19,19 +30,25 @@ function positiveInteger(value, fallback) {
   return Number.isInteger(number) && number > 0 ? number : fallback;
 }
 
-// Small output budgets keep requests under Groq's output-tokens-per-minute limit.
-const RECEIPT_MAX_TOKENS = positiveInteger(process.env.GROQ_RECEIPT_MAX_TOKENS, 900);
-const MATCH_MAX_TOKENS = positiveInteger(process.env.GROQ_MATCH_MAX_TOKENS, 200);
 const MAX_RATE_LIMIT_RETRIES = positiveInteger(process.env.GROQ_MAX_RETRIES, 3);
 const BACKOFF_BASE_MS = 1500;
 const BACKOFF_MAX_MS = 20000;
 
 export class GroqError extends Error {
-  constructor(message, { status = 0, retryAfterMs = 0 } = {}) {
+  constructor(message, {
+    status = 0,
+    retryAfterMs = 0,
+    responseBody = null,
+    causeMessage = null,
+    operation = 'receipt_extraction'
+  } = {}) {
     super(message);
     this.name = 'GroqError';
     this.status = status;
     this.retryAfterMs = retryAfterMs;
+    this.responseBody = responseBody;
+    this.causeMessage = causeMessage;
+    this.operation = operation;
   }
 }
 
@@ -46,90 +63,172 @@ function retryAfterMilliseconds(response) {
   return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 0;
 }
 
+function getGroqClient(fetchImpl, apiKey = GROQ_API_KEY) {
+  return new Groq({
+    apiKey: loadGroqApiKey(apiKey),
+    // The SDK otherwise implicitly honors GROQ_BASE_URL, including bad paths.
+    ...(process.env.GROQ_BASE_URL ? { baseURL: 'https://api.groq.com' } : {}),
+    maxRetries: 0,
+    ...(fetchImpl ? { fetch: fetchImpl } : {})
+  });
+}
+
+function redactProviderText(value, apiKey) {
+  let text = String(value ?? '');
+  if (apiKey) text = text.split(apiKey).join('[REDACTED]');
+  return text.replace(/gsk_[A-Za-z0-9_-]+/g, '[REDACTED]');
+}
+
+function providerError(error, operation, apiKey = GROQ_API_KEY) {
+  if (error instanceof GroqError) {
+    error.operation = operation;
+    return error;
+  }
+  const status = Number(error?.status) || 0;
+  const rawBody = error?.error ?? null;
+  const responseBody = rawBody == null ? null :
+    JSON.parse(redactProviderText(JSON.stringify(rawBody), apiKey));
+  const rawCause = error?.cause?.message ||
+    error?.cause?.cause?.message ||
+    null;
+  const causeMessage = rawCause ? redactProviderText(rawCause, apiKey) : null;
+  const bodyMessage = responseBody?.error?.message ||
+    responseBody?.message ||
+    responseBody?.error ||
+    null;
+  const message = status
+    ? `Groq request failed (HTTP ${status})${bodyMessage ? `: ${bodyMessage}` : `: ${redactProviderText(error.message, apiKey)}`}`
+    : causeMessage
+      ? `${redactProviderText(error?.message || 'Groq request failed.', apiKey)} Cause: ${causeMessage}`
+      : redactProviderText(error?.message || 'Groq request failed.', apiKey);
+  return new GroqError(message, {
+    status,
+    retryAfterMs: retryAfterMilliseconds(error),
+    responseBody,
+    causeMessage,
+    operation
+  });
+}
+
+function logProviderFailure(error, receiptId, operation) {
+  const details = error instanceof GroqError
+    ? error
+    : providerError(error, operation);
+  console.error('[receipt]', JSON.stringify({
+    event: 'provider_request_failed',
+    receiptId: receiptId || null,
+    operation,
+    status: details.status || null,
+    message: details.message,
+    cause: details.causeMessage,
+    responseBody: details.responseBody
+  }));
+}
+
 const RECEIPT_SYSTEM_PROMPT =
   'You are PriceDrop Agent. Extract only details supported by the provided receipt. Never invent prices, brands, dates, URLs, or product details. Return valid JSON only.';
 
-async function groqRequest(endpoint, options = {}) {
-  const { fetchImpl = fetch, ...fetchOptions } = options;
-  if (!GROQ_API_KEY) {
-    throw new Error(
-      'GROQ_API_KEY is missing. Add a real Groq API key to the .env file.'
-    );
-  }
-
-  const requestUrl = `${GROQ_URL}${endpoint}`;
-
-  let response;
-
+export async function checkGroqAvailability({
+  fetchImpl = fetch,
+  apiKey = GROQ_API_KEY,
+  receiptId = null
+} = {}) {
+  const operation = 'health_check';
+  console.info('[receipt]', JSON.stringify({
+    event: 'provider_request_started',
+    receiptId,
+    operation,
+    model: GROQ_MODEL
+  }));
   try {
-    response = await fetchImpl(requestUrl, {
-      ...fetchOptions,
-      headers: {
-        Authorization: `Bearer ${GROQ_API_KEY}`,
-        'Content-Type': 'application/json',
-        ...(fetchOptions.headers || {})
-      },
-      signal: AbortSignal.timeout(fetchOptions.timeout || 120000)
-    });
-  } catch (error) {
-    throw new GroqError(
-      `Could not connect to Groq at ${requestUrl}. ${error.message}`
-    );
-  }
-
-  if (!response.ok) {
-    const body = await response.text();
-
-    throw new GroqError(
-      `Groq returned ${response.status}: ${body.slice(0, 500)}`,
-      { status: response.status, retryAfterMs: retryAfterMilliseconds(response) }
-    );
-  }
-
-  return response;
-}
-
-export async function getLocalAIStatus() {
-  try {
-    const response = await groqRequest('/models', {
-      method: 'GET',
+    loadGroqApiKey(apiKey);
+    const response = await getGroqClient(fetchImpl, apiKey).chat.completions.create({
+      model: GROQ_MODEL,
+      messages: [{ role: 'user', content: 'Reply with OK.' }],
+      max_tokens: 1
+    }, {
+      maxRetries: 0,
       timeout: 10000
     });
-
-    const data = await response.json();
-    const models = Array.isArray(data.data) ? data.data : [];
-    const modelAvailable = models.some(model => model.id === GROQ_MODEL);
-
-    return {
-      provider: AI_PROVIDER,
-      model: GROQ_MODEL,
-      connected: true,
-      modelAvailable,
-      error: modelAvailable
-        ? ''
-        : `Groq is connected, but model "${GROQ_MODEL}" was not found.`
-    };
+    if (!Array.isArray(response.choices) || response.choices.length === 0) {
+      throw new GroqError('Groq health check returned an empty response.', {
+        operation
+      });
+    }
+    console.info('[receipt]', JSON.stringify({
+      event: 'provider_request_succeeded',
+      receiptId,
+      operation,
+      model: GROQ_MODEL
+    }));
+    return true;
   } catch (error) {
-    return {
-      provider: AI_PROVIDER,
-      model: GROQ_MODEL,
-      connected: false,
-      modelAvailable: false,
-      error: error.message
-    };
+    const details = providerError(error, operation, apiKey);
+    logProviderFailure(details, receiptId, operation);
+    throw details;
   }
 }
 
-function imageToDataUrl(image) {
+let cachedStatus;
+let statusExpiresAt = 0;
+let pendingStatus;
+const HEALTH_CACHE_MS = 60 * 1000;
+
+export async function getLocalAIStatus(options = {}) {
+  const useCache = Object.keys(options).length === 0;
+  if (useCache && cachedStatus && Date.now() < statusExpiresAt) return cachedStatus;
+  if (useCache && pendingStatus) return pendingStatus;
+
+  const request = (async () => {
+    try {
+      await checkGroqAvailability(options);
+      return {
+        provider: AI_PROVIDER,
+        model: GROQ_MODEL,
+        connected: true,
+        modelAvailable: true,
+        error: ''
+      };
+    } catch (error) {
+      return {
+        provider: AI_PROVIDER,
+        model: GROQ_MODEL,
+        connected: false,
+        modelAvailable: false,
+        error: error.message,
+        status: error.status || null
+      };
+    }
+  })();
+  if (!useCache) return request;
+  pendingStatus = request;
+  try {
+    cachedStatus = await request;
+    statusExpiresAt = Date.now() + HEALTH_CACHE_MS;
+    return cachedStatus;
+  } finally {
+    pendingStatus = undefined;
+  }
+}
+
+export function imageToDataUrl(image) {
   if (typeof image !== 'string' || !image.trim()) {
     return null;
   }
 
-  if (image.startsWith('data:image/')) {
+  const dataUrl = image.match(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/]+={0,2})$/i);
+  if (dataUrl) {
+    if (dataUrl[2].length % 4 === 1) {
+      throw new Error('Receipt image is not valid base64 data.');
+    }
     return image;
   }
 
-  return `data:image/jpeg;base64,${image}`;
+  const base64 = image.trim();
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(base64) || base64.length % 4 === 1) {
+    throw new Error('Receipt image is not valid base64 data.');
+  }
+  return `data:image/jpeg;base64,${base64}`;
 }
 
 export async function askGemma(
@@ -137,11 +236,13 @@ export async function askGemma(
   images = [],
   systemPrompt = RECEIPT_SYSTEM_PROMPT,
   {
-    maxTokens = RECEIPT_MAX_TOKENS,
     fetchImpl = fetch,
     sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
     maxRetries = MAX_RATE_LIMIT_RETRIES,
-    logger = console.warn
+    logger = console.warn,
+    receiptId = null,
+    operation = 'receipt_extraction',
+    apiKey = GROQ_API_KEY
   } = {}
 ) {
   const imageContent = images
@@ -153,53 +254,67 @@ export async function askGemma(
     }));
 
   const requestOptions = {
-    method: 'POST',
-    timeout: 300000,
-    fetchImpl,
-    body: JSON.stringify({
-      model: GROQ_MODEL,
-      temperature: 0,
-      max_tokens: maxTokens,
-      response_format: {
-        type: 'json_object'
+    model: GROQ_MODEL,
+    temperature: 0,
+    max_tokens: 2000,
+    response_format: {
+      type: 'json_object'
+    },
+    messages: [
+      {
+        role: 'system',
+        content: systemPrompt
       },
-      messages: [
-        {
-          role: 'system',
-          content: systemPrompt
-        },
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'text',
-              text: String(prompt)
-            },
-            ...imageContent
-          ]
-        }
-      ]
-    })
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: String(prompt)
+          },
+          ...imageContent
+        ]
+      }
+    ]
   };
 
   let response;
   for (let attempt = 0; ; attempt++) {
+    console.info('[receipt]', JSON.stringify({
+      event: 'provider_request_started',
+      receiptId,
+      operation,
+      model: GROQ_MODEL
+    }));
     try {
-      response = await groqRequest('/chat/completions', requestOptions);
+      const client = getGroqClient(fetchImpl, apiKey);
+      response = await client.chat.completions.create(requestOptions, {
+        timeout: 300000,
+        maxRetries: 0
+      });
+      console.info('[receipt]', JSON.stringify({
+        event: 'provider_request_succeeded',
+        receiptId,
+        operation,
+        model: GROQ_MODEL
+      }));
       break;
     } catch (error) {
-      if (error.status !== 429 || attempt >= maxRetries) throw error;
-      const delay = groqBackoffDelayMs(attempt, error.retryAfterMs);
+      const details = providerError(error, operation, apiKey);
+      logProviderFailure(details, receiptId, operation);
+      if (details.status !== 429 || attempt >= maxRetries) throw details;
+      const delay = groqBackoffDelayMs(attempt, details.retryAfterMs);
       logger(`Groq rate limited (429); retrying in ${delay} ms (attempt ${attempt + 1} of ${maxRetries}).`);
       await sleep(delay);
     }
   }
 
-  const data = await response.json();
-  const content = data.choices?.[0]?.message?.content;
+  const content = response.choices?.[0]?.message?.content;
 
   if (typeof content !== 'string' || !content.trim()) {
-    throw new GroqError('Groq returned an empty response.');
+    const error = new GroqError('Groq returned an empty response.', { operation });
+    logProviderFailure(error, receiptId, operation);
+    throw error;
   }
 
   const jsonText = content
@@ -207,9 +322,15 @@ export async function askGemma(
     .replace(/^\s*```(?:json)?\s*|\s*```\s*$/gi, '')
     .trim();
   try {
-    return JSON.parse(jsonText);
+    const parsed = JSON.parse(jsonText);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new TypeError('Expected a JSON object.');
+    }
+    return parsed;
   } catch {
-    throw new GroqError('Groq returned invalid JSON.');
+    const error = new GroqError('Groq returned invalid JSON.', { operation });
+    logProviderFailure(error, receiptId, operation);
+    throw error;
   }
 }
 
@@ -258,7 +379,7 @@ ${JSON.stringify({
     prompt,
     [],
     'You compare product identity using only the supplied evidence. Be conservative: conflicting or ambiguous model, variant, or condition evidence is not a match. Return valid JSON only.',
-    { maxTokens: MATCH_MAX_TOKENS }
+    { operation: 'product_match' }
   );
 
   const confidence = Number(parsed.confidence);

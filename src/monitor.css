@@ -238,7 +238,8 @@
   color: #26734d;
 }
 
-.monitoring-badge.unavailable {
+.monitoring-badge.unavailable,
+.monitoring-badge.linked {
   background: #fff2df;
   color: #9a5d00;
 }

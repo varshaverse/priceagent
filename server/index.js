@@ -1,10 +1,10 @@
+import './env.js';
+
 import express from 'express';
 
 import cors from 'cors';
 
 import multer from 'multer';
-
-import dotenv from 'dotenv';
 
 import fs from 'fs/promises';
 
@@ -25,6 +25,7 @@ import { isIP } from 'node:net';
 import crypto from 'crypto';
 
 import sharp from 'sharp';
+import { renderReceiptPdf } from './receipt-pdf.js';
 
 import {
   candidateUrlRejectionReason,
@@ -39,17 +40,17 @@ import {
 import { createReceiptExtractionRetryScheduler } from './receipt-retry.js';
 import {
   EXTRACTION_RETRY_MESSAGE,
-  RATE_LIMIT_MESSAGE,
   isGroqRateLimitError,
-  isTransientExtractionError,
   sanitizeErrorText
 } from './errors.js';
-import { resolveReceiptRetailer } from './retailers.js';
+import { knownRetailerDomain, resolveReceiptRetailer } from './retailers.js';
 import { receiptDateForMerchant, recoverReceiptDate } from './receipt-dates.js';
 
 import {
 
   askGemma,
+
+  GroqError,
 
   getLocalAIStatus,
 
@@ -68,10 +69,8 @@ import {
   registrableDomain,
   resolveOfficialRetailerDomain,
   retailerMatchesHost,
-  saveFoundUrlBeforeVerification,
   saveFoundProductUrl,
   saveVerifiedProductMatch,
-  selectBestProductMatch,
   searchRetailerProductPages,
   searchPublicProductPages
 } from './product-discovery.js';
@@ -98,6 +97,8 @@ import {
 
   ensureMonitoringMetadata,
 
+  hasMonitorableUrl,
+
   isFutureDateOnly,
 
   isValidDateOnly,
@@ -107,6 +108,7 @@ import {
   localDateString,
   monitoringDashboardStats,
   monitoringStatusFor,
+  priceStatusFor,
   monitoringWindow,
   receiptDateState,
   receiptDateNeedsConfirmation,
@@ -115,12 +117,6 @@ import {
   startMonitoringScheduler
 
 } from './monitoring.js';
-
-
-
-dotenv.config();
-
-
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -136,19 +132,27 @@ const EMAIL_SETTINGS_FILE = path.join(DATA_DIR, 'email-settings.json');
 
 const PORT = Number(process.env.PORT || 4100);
 
-const configuredMonitorInterval = Number(process.env.MONITOR_INTERVAL_MINUTES || 60);
-
-const MONITOR_INTERVAL_MINUTES = Number.isFinite(configuredMonitorInterval)
-
-  ? Math.max(15, configuredMonitorInterval)
-
-  : 60;
+const configuredPriceInterval = Number(process.env.PRICE_CHECK_INTERVAL_HOURS || 24);
+if (!Number.isFinite(configuredPriceInterval) || configuredPriceInterval < 24) {
+  console.warn('PRICE_CHECK_INTERVAL_HOURS must be at least 24; using 24 hours.');
+}
+const PRICE_CHECK_INTERVAL_HOURS = Number.isFinite(configuredPriceInterval) &&
+  configuredPriceInterval >= 24 ? configuredPriceInterval : 24;
 
 const activeDiscoveries = new Set();
 
-const MONITOR_INTERVAL_MS = MONITOR_INTERVAL_MINUTES * 60 * 1000;
-const RECEIPT_EXTRACTION_RETRY_MS = 15 * 60 * 1000;
-
+const MONITOR_INTERVAL_MS = PRICE_CHECK_INTERVAL_HOURS * 60 * 60 * 1000;
+const configuredProductDiscoveryInterval = Number(
+  process.env.PUBLIC_PRODUCT_DISCOVERY_INTERVAL_HOURS || 24
+);
+if (!Number.isFinite(configuredProductDiscoveryInterval) || configuredProductDiscoveryInterval <= 0) {
+  console.warn('PUBLIC_PRODUCT_DISCOVERY_INTERVAL_HOURS must be positive; using 24 hours.');
+}
+const PRODUCT_DISCOVERY_INTERVAL_MS = (
+  Number.isFinite(configuredProductDiscoveryInterval) && configuredProductDiscoveryInterval > 0
+    ? configuredProductDiscoveryInterval
+    : 24
+) * 60 * 60 * 1000;
 const configuredAlternativeInterval = Number(
 
   process.env.ALTERNATIVE_DISCOVERY_INTERVAL_HOURS || 24
@@ -450,12 +454,8 @@ async function loadTrackedRecord(id) {
       const purchaseDate = receiptPurchaseDate(receipt, product);
       product.date = purchaseDate;
       product.purchaseDate = purchaseDate;
-      product.purchaseDateNeedsConfirmation = receiptDateNeedsConfirmation(
-        purchaseDate,
-        receipt.uploadedAt,
-        receipt.purchaseDateConfirmedByUser === true ||
-          product.purchaseDateConfirmedByUser === true
-      );
+      product.purchaseDateNeedsConfirmation = normalizeProduct(product, receipt)
+        .purchaseDateNeedsConfirmation;
 
       product.retailer = receipt.merchant || product.retailer;
 
@@ -530,6 +530,8 @@ function receiptPurchaseDate(receipt, product) {
 }
 
 function receiptStatusFor(receipt, purchaseDate = receipt.purchaseDate) {
+  if (receipt.extractionStatus === 'failed') return 'EXTRACTION FAILED';
+  if (receipt.extractionStatus === 'retry_pending') return 'RETRY PENDING';
   if (receiptDateNeedsConfirmation(
     purchaseDate,
     receipt.uploadedAt,
@@ -561,15 +563,7 @@ function daysRemaining(purchaseDate) {
 
 
 function nextCheckForProduct(product, status) {
-  if (
-    status === 'SEARCHING FOR PRODUCT URL' ||
-    status === 'AWAITING PRODUCT URL' ||
-    status === 'PURCHASE DATE NEEDS CONFIRMATION' &&
-      product.originalUrlVerified !== true
-  ) {
-    return product.nextProductDiscoveryAt || null;
-  }
-  if (status === 'WATCH EXPIRED' || status === 'PURCHASE DATE NEEDS CONFIRMATION') {
+  if (status !== 'ON WATCH' || !hasMonitorableUrl(product)) {
 
     return null;
 
@@ -721,7 +715,10 @@ function normalizeProduct(product, receipt) {
     receipt.uploadedAt,
     receipt.purchaseDateConfirmedByUser === true ||
       product.purchaseDateConfirmedByUser === true
-  );
+  ) || (receipt.purchaseDateNeedsConfirmation === true ||
+    product.purchaseDateNeedsConfirmation === true) &&
+      receipt.purchaseDateConfirmedByUser !== true &&
+      product.purchaseDateConfirmedByUser !== true;
 
 
 
@@ -914,7 +911,7 @@ async function receiptImageViews(buffer) {
 
 
 
-async function extractReceipt(file) {
+async function extractReceipt(file, receiptId) {
 
   const isPdf = file.buffer.subarray(0, 1024).toString('latin1').includes('%PDF-');
 
@@ -926,8 +923,13 @@ async function extractReceipt(file) {
 
   try {
 
-    const views = await receiptImageViews(file.buffer);
-    images = views.map(image => image.toString('base64'));
+    const pdfPages = isPdf ? await renderReceiptPdf(file.buffer) : [file.buffer];
+    const views = pdfPages.length === 1
+      ? await receiptImageViews(pdfPages[0])
+      : await Promise.all(pdfPages.map(normalizeReceiptImage));
+    images = views.map(image =>
+      `data:image/jpeg;base64,${image.toString('base64')}`
+    );
 
   } catch (imageError) {
 
@@ -959,14 +961,22 @@ async function extractReceipt(file) {
 
   }
 
-
+  console.info('[receipt]', JSON.stringify({
+    event: 'image_loaded',
+    receiptId,
+    source: images.length ? 'image' : 'text',
+    mimeType: images.length ? 'image/jpeg' : 'text/plain',
+    imageCount: images.length,
+    byteLength: file.buffer.length
+  }));
 
   const prompt = `Read this purchase receipt. Return ONLY compact JSON, using null for anything not printed:
-{"merchant":"store name as printed","merchantEvidence":"store header text, web address, or store number as printed","purchaseDateEvidence":"exact printed purchase date text including year","purchaseDate":"YYYY-MM-DD","total":number,"products":[{"name":"item as printed","brand":"","model":"","sku":"printed item number","size":"","variant":"","quantity":number,"price":number,"ocrText":"literal item-line text"}]}
+{"merchant":"store name as printed","merchantEvidence":"store header text, web address, or store number as printed","purchaseDateEvidence":"exact printed purchase date text including year","purchaseDate":"YYYY-MM-DD","total":number,"currency":"ISO 4217 currency code such as USD","products":[{"name":"item as printed","brand":"","model":"","sku":"printed item number","size":"","variant":"","quantity":number,"paidPrice":number,"price":number,"ocrText":"literal item-line text"}]}
 Rules:
 - Include purchased line items only; never tax, discounts, savings, shipping, or totals.
 - Never invent a brand, model, SKU, quantity, price, or date. Use null when not readable.
 - price is what was paid for that line, not a discount or the receipt total.
+- Return the receipt currency as an ISO 4217 code when printed or unambiguous; otherwise use null.
 - Find the transaction date (top, bottom, or beside the total) in every image. Copy it exactly into purchaseDateEvidence; it is not a time, card expiry, member number, or barcode. Do not use today's date or the upload date.
 - If the date or its year is not legible, return null for purchaseDateEvidence and purchaseDate.
 - If an item name is suspicious OCR, keep it as printed and put its SKU and nearby text in ocrText.`;
@@ -985,7 +995,10 @@ ${text.slice(0, 18000)}`
 
   : prompt;
 
-  const parsed = await askGemma(promptWithText, images);
+  const parsed = await askGemma(promptWithText, images, undefined, { receiptId });
+  const products = Array.isArray(parsed.products)
+    ? parsed.products.filter(item => item && typeof item === 'object' && !Array.isArray(item))
+    : [];
   const purchaseDateEvidence = typeof parsed.purchaseDateEvidence === 'string'
     ? parsed.purchaseDateEvidence.trim().slice(0, 50)
     : '';
@@ -994,13 +1007,20 @@ ${text.slice(0, 18000)}`
     typeof parsed.merchantEvidence === 'string' ? parsed.merchantEvidence : ''
   );
   const purchaseDate = receiptDateForMerchant(purchaseDateEvidence, retailer.merchant);
+  const currency = typeof parsed.currency === 'string' &&
+    /^[A-Z]{3}$/.test(parsed.currency.trim().toUpperCase())
+    ? parsed.currency.trim().toUpperCase()
+    : null;
   console.info('[receipt]', JSON.stringify({
-    event: 'receipt_extracted',
+    event: 'extraction_parsed',
+    receiptId,
     merchant: retailer.merchant,
     retailerResolved: retailer.known,
     officialDomain: retailer.domain || null,
     purchaseDate,
-    products: Array.isArray(parsed.products) ? parsed.products.length : 0
+    total: parsed.total ?? null,
+    currency,
+    products: products.length
   }));
 
 
@@ -1029,11 +1049,10 @@ ${text.slice(0, 18000)}`
 
         : null,
 
+    currency,
 
+    products: products
 
-    products: Array.isArray(parsed.products)
-
-      ? parsed.products
 
           .map(item => ({
 
@@ -1100,13 +1119,13 @@ ${text.slice(0, 18000)}`
 
             price:
 
-              item.price != null &&
+              (item.paidPrice ?? item.price) != null &&
 
-              Number.isFinite(Number(item.price)) &&
+              Number.isFinite(Number(item.paidPrice ?? item.price)) &&
 
-              Number(item.price) > 0
+              Number(item.paidPrice ?? item.price) > 0
 
-                ? Number(item.price)
+                ? Number(item.paidPrice ?? item.price)
 
                 : null
 
@@ -1122,8 +1141,6 @@ ${text.slice(0, 18000)}`
 
           )
 
-      : []
-
   };
 
 }
@@ -1132,7 +1149,8 @@ function createReceiptProducts(
   parsed,
   purchaseDate,
   purchaseDateConfirmed,
-  purchaseDateNeedsConfirmation
+  purchaseDateNeedsConfirmation,
+  purchaseDateConfirmedByUser = false
 ) {
   const dateState = receiptDateState(purchaseDate);
   return parsed.products.map(item => ({
@@ -1156,6 +1174,7 @@ function createReceiptProducts(
     quantity: item.quantity,
     price: item.price == null ? 0 : Number(item.price),
     purchasePrice: item.price == null ? 0 : Number(item.price),
+    currency: parsed.currency || null,
     watch: dateState.watch,
     status: dateState.status,
     url: '',
@@ -1163,13 +1182,9 @@ function createReceiptProducts(
     officialRetailerDomain: parsed.officialRetailerDomain || '',
     purchaseDateConfirmed,
     purchaseDateNeedsConfirmation,
-    purchaseDateConfirmedByUser: false,
+    purchaseDateConfirmedByUser,
     discoveryStatus: 'queued',
-    monitoringStatus: purchaseDateNeedsConfirmation || !purchaseDateConfirmed
-      ? 'PURCHASE DATE NEEDS CONFIRMATION'
-      : dateState.status === 'WATCH'
-        ? 'AWAITING PRODUCT URL'
-        : dateState.status,
+    monitoringStatus: monitoringStatusFor({ purchaseDate, purchaseDateNeedsConfirmation }),
     currentPrice: null,
     matchConfidence: 0,
     lastCheckedAt: null,
@@ -1327,14 +1342,24 @@ async function evaluateListing(
 
 
 
-async function discoverOriginalListing(product) {
+async function discoverOriginalListing(product, persist = async () => {}, searchCache = null) {
   if (!product.retailer) {
     throw new Error('Enter the original retailer to search for its product page.');
   }
-  const { domain, results } = await searchRetailerProductPages(
-    product.retailer,
-    product
-  );
+  const searchKey = JSON.stringify([
+    product.retailer, product.officialRetailerDomain, product.name || product.product,
+    product.sku, product.brand, product.model, product.variant, product.size,
+    product.bundle, product.condition, product.description, product.quantity,
+    product.productLineDetails, product.nearbyReceiptText, product.ocrText,
+    ...(Array.isArray(product.attributes) ? product.attributes : []),
+    ...(Array.isArray(product.identityAttributes) ? product.identityAttributes : [])
+  ].map(value => String(value || '').trim().toLowerCase()));
+  let search = searchCache?.get(searchKey);
+  if (!search) {
+    search = searchRetailerProductPages(product.retailer, product);
+    searchCache?.set(searchKey, search);
+  }
+  const { domain, results, blocked } = await search;
   console.info('[product-discovery]', JSON.stringify({
     event: 'retailer_search_completed',
     retailer: product.retailer,
@@ -1342,13 +1367,18 @@ async function discoverOriginalListing(product) {
     domain,
     candidateUrls: results.map(result => result.url)
   }));
+  product.discoveryCandidates = results.map(result => ({
+    url: result.url,
+    title: result.title || '',
+    priceVerified: false
+  }));
+  await persist();
   if (!domain) {
     product.discoveryStatus = 'awaiting_url';
-    product.lastProductDiscoveryAt = new Date().toISOString();
-    product.lastError = null;
+    product.lastError = 'The official retailer domain could not be determined.';
     product.discoveryMessage =
       'The agent could not verify the product page yet. It will continue searching automatically. You may paste the product URL as a fallback.';
-    product.monitoringStatus = 'AWAITING PRODUCT URL';
+    product.monitoringStatus = monitoringStatusFor(product);
     console.info('[product-discovery]', JSON.stringify({
       event: 'discovery_finished',
       retailer: product.retailer,
@@ -1358,23 +1388,7 @@ async function discoverOriginalListing(product) {
     return false;
   }
   product.officialRetailerDomain = domain;
-  const matches = [];
-  let firstFoundUrl = '';
-  let clearlyDifferentCandidates = 0;
-  const validCandidates = [];
   for (const result of results) {
-    let hostname;
-
-    try {
-
-      hostname = new URL(result.url).hostname;
-
-    } catch {
-
-      continue;
-
-    }
-
     const urlRejection = candidateUrlRejectionReason(
       result.url,
       domain,
@@ -1391,59 +1405,30 @@ async function discoverOriginalListing(product) {
       }));
       continue;
     }
-    validCandidates.push(result);
-    if (!firstFoundUrl) {
-      firstFoundUrl = result.url;
-      console.info('[product-discovery]', JSON.stringify({
-        event: 'first_valid_product_selected',
-        retailer: product.retailer,
-        product: product.name || product.product || '',
-        candidateUrl: result.url,
-        candidateTitle: result.title || '',
-        status: 'URL FOUND'
-      }));
-    }
+    saveFoundProductUrl(product, result.url);
+    product.discoveryMessage = 'Product link saved. Product identity is not verified.';
+    product.productDiscoveryError = null;
+    await persist();
     try {
-      const { candidate, match, aiMatch, identityComparisonSkipped } = await saveFoundUrlBeforeVerification(
-        product,
-        result.url,
-        () => evaluateListing(product, result)
-      );
-      if (aiMatch == null && !identityComparisonSkipped) {
-        product.productDiscoveryError =
-          'Product identity comparison is temporarily unavailable. The agent will retry automatically.';
-      }
-
+      const { candidate, match } = await evaluateListing(product, result);
       if (match.accepted) {
-
-        matches.push({
-
+        const verifiedMatch = {
           title: candidate.title,
-
           url: candidate.url,
-
           retailer: product.retailer,
-
           price: match.priceVerified ? candidate.price : null,
-
           currency: match.priceVerified ? candidate.currency : null,
-
           priceVerified: match.priceVerified,
-
+          exactSku: match.exactSku,
           matchConfidence: match.confidence,
-
           matchEvidence: match.reason
-
-        });
-      } else if (
-        match.reason.startsWith('Product title, brand, or model did not match') ||
-        aiMatch?.equivalent === false &&
-          aiMatch.confidence >= 0.9 &&
-          (aiMatch.sameVariant === false || aiMatch.sameCondition === false)
-      ) {
-        clearlyDifferentCandidates++;
+        };
+        product.discoveryCandidates[product.discoveryCandidates.findIndex(item => item.url === result.url)] = verifiedMatch;
+        saveVerifiedProductMatch(product, verifiedMatch);
+        product.discoveryMessage = '';
+      } else {
+        product.productDiscoveryError = match.reason;
       }
-
     } catch (error) {
       console.info('[product-discovery]', JSON.stringify({
         event: 'candidate_page_failed',
@@ -1455,57 +1440,25 @@ async function discoverOriginalListing(product) {
       product.productDiscoveryError = isGroqRateLimitError(error)
         ? 'Product identity comparison is temporarily rate limited. The agent will retry automatically.'
         : sanitizeErrorText(error.message);
-      if (isGroqRateLimitError(error)) break;
     }
-  }
-
-  product.lastProductDiscoveryAt = new Date().toISOString();
-
-  product.discoveryCandidates = matches;
-
-  if (matches.length >= 1) {
-    const match = selectBestProductMatch(matches);
-    saveVerifiedProductMatch(product, match);
-    product.discoveryMessage = '';
+    product.monitoringStatus = monitoringStatusFor(product);
     console.info('[product-discovery]', JSON.stringify({
-      event: 'verified_url_saved',
+      event: 'product_url_saved',
       retailer: product.retailer,
       product: product.name || product.product || '',
       candidateUrl: product.url,
-      currentPrice: product.currentVerifiedPrice,
-      candidatesConsidered: matches.length,
-      status: product.monitoringStatus
+      identityVerified: product.originalUrlVerified === true
     }));
-    return true;
+    return product.originalUrlVerified === true;
   }
 
-  if (firstFoundUrl && clearlyDifferentCandidates < validCandidates.length) {
-    saveFoundProductUrl(product, firstFoundUrl);
-    product.monitoringStatus = 'URL FOUND';
-    product.lastError = null;
-    product.discoveryMessage =
-      'A product page was found on the original retailer. Product identity and current price will be checked again automatically.';
-    console.info('[product-discovery]', JSON.stringify({
-      event: 'discovery_finished',
-      retailer: product.retailer,
-      product: product.name || product.product || '',
-      candidateUrl: product.url,
-      currentPrice: product.currentVerifiedPrice ?? null,
-      status: product.monitoringStatus
-    }));
-    return false;
-  }
-
-  if (firstFoundUrl && validCandidates.length > 0 &&
-    clearlyDifferentCandidates === validCandidates.length) {
-    product.url = '';
-    product.originalUrlVerified = false;
-  }
-  product.discoveryStatus = 'awaiting_url';
-  product.lastError = null;
-  product.discoveryMessage =
-    'The agent could not verify the product page yet. It will continue searching automatically. You may paste the product URL as a fallback.';
-  product.monitoringStatus = 'AWAITING PRODUCT URL';
+  product.discoveryStatus = blocked || domain === 'costco.com' && !results.length
+    ? 'blocked' : 'awaiting_url';
+  product.lastError = product.discoveryStatus === 'blocked'
+    ? 'Costco search was blocked or returned no results'
+    : product.productDiscoveryError || 'The product page could not be verified.';
+  product.discoveryMessage = product.lastError;
+  product.monitoringStatus = monitoringStatusFor(product);
   console.info('[product-discovery]', JSON.stringify({
     event: 'discovery_finished',
     retailer: product.retailer,
@@ -1573,17 +1526,17 @@ async function verifyOriginalProductUrl(product) {
   if (!match.accepted) {
     product.originalUrlVerified = false;
     product.discoveryStatus = 'found';
-    product.lastError = null;
+    product.lastError = match.reason;
     product.discoveryMessage =
       'The product page was found. Product identity and price verification will retry automatically.';
-    product.monitoringStatus = 'URL FOUND';
+    product.monitoringStatus = monitoringStatusFor(product);
     return false;
   }
 
   product.originalUrlVerified = true;
 
-  product.discoveryStatus = 'matched';
-  product.monitoringStatus = 'URL VERIFIED';
+  product.discoveryStatus = 'verified';
+  product.monitoringStatus = monitoringStatusFor(product);
 
   product.matchConfidence = match.confidence;
 
@@ -1928,6 +1881,12 @@ async function sendAlert(receipt, product, { price, savings, savingsPercent, det
 
 
   const retailerName = product.retailer || receipt.merchant || 'Retailer';
+  const identityWarning = product.originalUrlVerified === true
+    ? ''
+    : 'The saved product link has not been identity-verified; check that it is the correct item.';
+  const priceSourceWarning = product.currentPriceSource === 'Costco warehouse price'
+    ? 'Costco warehouse prices may vary by location and may differ from online prices.'
+    : '';
   const html = [
     '<h2>Price drop detected</h2>',
     `<p><strong>Product:</strong> ${safeName}<br>`,
@@ -1936,6 +1895,8 @@ async function sendAlert(receipt, product, { price, savings, savingsPercent, det
     `<strong>Current price:</strong> $${price.toFixed(2)}<br>`,
     `<strong>Savings:</strong> $${savings.toFixed(2)} (${savingsPercent.toFixed(1)}%)<br>`,
     `<strong>Product link:</strong> <a href="${safeUrl}">${safeUrl}</a></p>`,
+    ...(identityWarning ? [`<p>${escapeHtml(identityWarning)}</p>`] : []),
+    ...(priceSourceWarning ? [`<p>${escapeHtml(priceSourceWarning)}</p>`] : []),
     `<p>Detected ${escapeHtml(detectedAtLabel)}. ${remainingDays} day${remainingDays === 1 ? '' : 's'} remain in the 30-day watch. Check ${safeRetailer}'s official return, price-adjustment, or price-match policy${safePolicyUrl ? ` (<a href="${safePolicyUrl}">policy</a>)` : ''}; eligibility is not guaranteed. PriceDrop Agent will not initiate a return, refund, or purchase.</p>`,
     alternativeHtml
   ].join('');
@@ -1949,7 +1910,10 @@ async function sendAlert(receipt, product, { price, savings, savingsPercent, det
       `Purchase price: $${purchasePrice.toFixed(2)}`,
       `Current price: $${price.toFixed(2)}`,
       `Savings: $${savings.toFixed(2)}`,
+        `Savings percentage: ${savingsPercent.toFixed(1)}%`,
       `Product link: ${product.url}`,
+      ...(identityWarning ? [identityWarning] : []),
+      ...(priceSourceWarning ? [priceSourceWarning] : []),
       '',
       `Detected: ${detectedAtLabel}. Days remaining in the 30-day watch: ${remainingDays}.`,
       `Check ${retailerName}'s official return, price-adjustment, or price-match policy. Eligibility is not guaranteed.`,
@@ -2248,6 +2212,7 @@ app.get('/api/receipts', async (_, res) => {
         ).map(product => {
 
           const normalized = normalizeProduct(product, receipt);
+          ensureMonitoringMetadata(normalized, normalized.date);
 
           return {
 
@@ -2256,12 +2221,13 @@ app.get('/api/receipts', async (_, res) => {
             originalUrlVerified: product.originalUrlVerified === true,
 
             monitoringStatus: monitoringStatusFor(normalized),
+            priceStatus: priceStatusFor(normalized),
 
             purchaseDateNeedsConfirmation:
 
               monitoringStatusFor(normalized) === 'PURCHASE DATE NEEDS CONFIRMATION',
 
-            currentPrice: product.originalUrlVerified === true &&
+            currentPrice: hasMonitorableUrl(normalized) &&
 
               product.currentVerifiedPrice != null &&
 
@@ -2305,7 +2271,23 @@ app.post(
         });
       }
 
+      const submittedDate = req.body?.purchaseDate;
+      if (submittedDate != null && typeof submittedDate !== 'string') {
+        return res.status(400).json({ error: 'Enter one valid purchase date in YYYY-MM-DD format.' });
+      }
+      const userPurchaseDate = submittedDate?.trim() || '';
+      if (userPurchaseDate && (!isValidDateOnly(userPurchaseDate) || isFutureDateOnly(userPurchaseDate))) {
+        return res.status(400).json({ error: 'Enter a valid purchase date that is not in the future.' });
+      }
+
       const receiptId = crypto.randomUUID();
+      console.info('[receipt]', JSON.stringify({
+        event: 'receipt_received',
+        receiptId,
+        fileName: req.file.originalname,
+        mimeType: req.file.mimetype,
+        byteLength: req.file.size
+      }));
       const safeName =
         req.file.originalname
           .replace(/[^a-zA-Z0-9._-]/g, '_')
@@ -2315,39 +2297,57 @@ app.post(
 
       let parsed;
       try {
-        parsed = await extractReceipt(req.file);
+        parsed = await extractReceipt(req.file, receiptId);
       } catch (error) {
-        if (!isTransientExtractionError(error)) throw error;
-        const rateLimited = isGroqRateLimitError(error);
-        console.warn('[receipt]', JSON.stringify({
-          event: 'extraction_deferred',
-          reason: rateLimited ? 'rate_limited' : 'provider_unavailable'
-        }));
+        if (!(error instanceof GroqError)) throw error;
+
+        const rateLimited = error.status === 429 &&
+          error.operation === 'receipt_extraction';
         const receipt = {
           id: receiptId,
           merchant: 'Unknown merchant',
-          purchaseDate: null,
+          purchaseDate: userPurchaseDate || null,
+          purchaseDateConfirmed: Boolean(userPurchaseDate),
+          purchaseDateConfirmedByUser: Boolean(userPurchaseDate),
+          purchaseDateNeedsConfirmation: !userPurchaseDate,
           total: null,
+          currency: null,
           fileName: req.file.originalname,
           mimeType: req.file.mimetype,
           storedFile,
           uploadedAt: new Date().toISOString(),
-          extractionMethod: 'Groq',
-          extractionStatus: 'retry_pending',
-          extractionMessage: rateLimited ? RATE_LIMIT_MESSAGE : EXTRACTION_RETRY_MESSAGE,
-          nextExtractionRetryAt: new Date(Date.now() + RECEIPT_EXTRACTION_RETRY_MS).toISOString(),
-          status: 'EXTRACTING',
+          extractionMethod: `Groq (${OLLAMA_MODEL})`,
+          extractionStatus: 'failed',
+          extractionReason: rateLimited ? 'rate_limited' : 'groq_error',
+          extractionHttpStatus: error.status || null,
+          extractionMessage: error.message,
+          status: 'EXTRACTION FAILED',
           products: []
         };
+        console.error('[receipt]', JSON.stringify({
+          event: 'extraction_failed',
+          receiptId,
+          operation: error.operation,
+          reason: receipt.extractionReason,
+          status: error.status || null,
+          message: error.message,
+          responseBody: error.responseBody
+        }));
         await saveNewReceipt(receipt);
-        await receiptExtractionRetryScheduler.schedule();
+        console.info('[receipt]', JSON.stringify({
+          event: 'receipt_updated',
+          receiptId,
+          extractionStatus: receipt.extractionStatus
+        }));
         return res.status(201).json({
           ...receipt,
+          status: 'failed',
+          reason: receipt.extractionReason,
           message: receipt.extractionMessage
         });
       }
 
-      const purchaseDate = parsed.purchaseDate;
+      const purchaseDate = userPurchaseDate || parsed.purchaseDate;
       const purchaseDateConfirmed = isValidDateOnly(purchaseDate) &&
         !isFutureDateOnly(purchaseDate);
       const uploadedAt = new Date().toISOString();
@@ -2362,6 +2362,7 @@ app.post(
         purchaseDate,
         purchaseDateConfirmed,
         total: parsed.total,
+        currency: parsed.currency,
         fileName: req.file.originalname,
         mimeType: req.file.mimetype,
         storedFile,
@@ -2370,17 +2371,27 @@ app.post(
         extractionStatus: 'complete',
         purchaseDateEvidence: parsed.purchaseDateEvidence || null,
         purchaseDateNeedsConfirmation,
-        purchaseDateConfirmedByUser: false,
+        purchaseDateConfirmedByUser: Boolean(userPurchaseDate),
         watch: dateState.watch,
         status: dateState.status,
         products: createReceiptProducts(
           parsed,
           purchaseDate,
           purchaseDateConfirmed,
-          purchaseDateNeedsConfirmation
+          purchaseDateNeedsConfirmation,
+          Boolean(userPurchaseDate)
         )
       };
       await saveNewReceipt(receipt);
+      console.info('[receipt]', JSON.stringify({
+        event: 'receipt_updated',
+        receiptId,
+        extractionStatus: receipt.extractionStatus,
+        merchant: receipt.merchant,
+        purchaseDate: receipt.purchaseDate,
+        currency: receipt.currency,
+        products: receipt.products.length
+      }));
       // Discovery starts right away but never blocks the upload response; the
       // dashboard polls for progress.
       runMonitoringWhenIdle().catch(error => {
@@ -2500,6 +2511,7 @@ app.get('/api/monitor/products', async (_, res) => {
             monitoringExpirationDate: normalized.monitoringExpirationDate || window.expirationDate,
 
             monitoringStatus: currentMonitoringStatus,
+            priceStatus: priceStatusFor(normalized),
 
             purchaseDateNeedsConfirmation:
 
@@ -2586,6 +2598,7 @@ app.get('/api/monitor/products', async (_, res) => {
           monitoringExpirationDate: product.monitoringExpirationDate || window.expirationDate,
 
           monitoringStatus: currentMonitoringStatus,
+          priceStatus: priceStatusFor(product),
 
           purchaseDateNeedsConfirmation:
 
@@ -2674,40 +2687,54 @@ app.post('/api/monitor/products/:id/discover', async (req, res) => {
 
 
     const { product } = record;
-    if (product.url && product.originalUrlVerified === true) {
+    if (monitoringStatusFor(product) !== 'ON WATCH') {
+      return res.status(400).json({
+        error: monitoringStatusFor(product) === 'OFF WATCH'
+          ? 'Product search is paused because the purchase is outside the 30-day watch window.'
+          : 'Confirm the purchase date before searching for a product page.'
+      });
+    }
+    if (product.url) {
       return res.json({
         ok: true,
-        message: 'The original retailer product URL is already verified.',
+        message: product.originalUrlVerified
+          ? 'The original retailer product URL is already verified.'
+          : 'Product link already saved; product identity is unverified.',
 
         product,
 
         monitoringStatus: monitoringStatusFor(product)
       });
     }
+    if (activeDiscoveries.has(product.id)) {
+      return res.status(409).json({ ok: false, error: 'Product discovery is already running.' });
+    }
     activeDiscoveries.add(product.id);
     try {
+      product.lastProductDiscoveryAt = new Date().toISOString();
+      product.productDiscoveryError = null;
       product.discoveryStatus = 'searching';
-      product.monitoringStatus = 'SEARCHING FOR PRODUCT URL';
+      product.monitoringStatus = monitoringStatusFor(product);
       product.nextProductDiscoveryAt = new Date(
-        Date.now() + ALTERNATIVE_DISCOVERY_INTERVAL_MS
+        Date.parse(product.lastProductDiscoveryAt) + PRODUCT_DISCOVERY_INTERVAL_MS
       ).toISOString();
       await record.persist();
       if (product.url) {
         await verifyOriginalProductUrl(product);
       } else {
-        await discoverOriginalListing(product);
+        await discoverOriginalListing(product, record.persist);
       }
     } catch (error) {
       product.discoveryStatus = product.url ? 'found' : 'awaiting_url';
-      product.lastError = null;
       product.discoveryMessage =
         product.url
           ? 'The product page was found. Product identity and price verification will retry automatically.'
           : 'The agent could not verify the product page yet. It will continue searching automatically. You may paste the product URL as a fallback.';
-      product.monitoringStatus = product.url ? 'URL FOUND' : 'AWAITING PRODUCT URL';
+      product.monitoringStatus = monitoringStatusFor(product);
       product.productDiscoveryError = isGroqRateLimitError(error)
         ? 'Product identity comparison is temporarily rate limited. The agent will retry automatically.'
         : sanitizeErrorText(error.message);
+      product.lastError = product.productDiscoveryError;
     } finally {
       activeDiscoveries.delete(product.id);
     }
@@ -2723,9 +2750,7 @@ app.post('/api/monitor/products/:id/discover', async (req, res) => {
       ok: true,
       message: product.originalUrlVerified
         ? 'Original retailer product URL verified and saved.'
-        : product.discoveryStatus === 'needs_confirmation'
-          ? 'Multiple matching product pages need your confirmation.'
-          : product.discoveryMessage || 'No matching product page could be verified yet. The receipt and product remain saved.',
+        : product.discoveryMessage || 'No matching product page could be verified yet. The receipt and product remain saved.',
       product,
       monitoringStatus: monitoringStatusFor(product)
     });
@@ -2805,7 +2830,11 @@ app.post('/api/monitor/products/:id/confirm-url', async (req, res) => {
       });
     }
 
+    const previousUrl = record.product.url;
     record.product.url = parsedUrl.toString();
+    if (previousUrl !== record.product.url || !record.product.urlSavedAt) {
+      record.product.urlSavedAt = new Date().toISOString();
+    }
     if (domain) record.product.officialRetailerDomain = domain;
     record.product.originalUrlVerified = false;
     let verified = false;
@@ -2816,15 +2845,26 @@ app.post('/api/monitor/products/:id/confirm-url', async (req, res) => {
     }
 
     if (!verified) {
-      record.product.discoveryStatus = 'awaiting_url';
-      record.product.lastError = null;
+      record.product.discoveryStatus = 'found';
+      record.product.lastError = record.product.productDiscoveryError || record.product.lastError || null;
       record.product.discoveryMessage =
-        'URL saved. Verification is pending; the agent will retry automatically.';
-      record.product.monitoringStatus = 'AWAITING PRODUCT URL';
+        'Product link saved. Product identity is not verified; daily price checks can continue.';
+      if (previousUrl !== record.product.url) {
+        record.product.currentVerifiedPrice = null;
+        record.product.currentPrice = null;
+        record.product.currentPriceSource = null;
+        record.product.priceStatus = 'MONITORING';
+      }
+      record.product.monitoringStatus = monitoringStatusFor(record.product);
       record.product.nextProductDiscoveryAt = new Date(
-        Date.now() + ALTERNATIVE_DISCOVERY_INTERVAL_MS
+        Date.now() + PRODUCT_DISCOVERY_INTERVAL_MS
       ).toISOString();
       await record.persist();
+      try {
+        await runMonitoringWhenIdle();
+      } catch (error) {
+        console.error('Could not schedule monitoring after saving URL:', error.message);
+      }
       return res.json({
         ok: true,
         message: record.product.discoveryMessage,
@@ -2839,13 +2879,8 @@ app.post('/api/monitor/products/:id/confirm-url', async (req, res) => {
 
 
 
-    const confirmedPurchaseDate = record.product.purchaseDate || record.product.date;
-    record.product.watch = statusFor(confirmedPurchaseDate);
-    record.product.monitoringStatus =
-      !isValidDateOnly(confirmedPurchaseDate) ||
-      isFutureDateOnly(confirmedPurchaseDate) && !record.product.purchaseDateConfirmed
-        ? 'PURCHASE DATE NEEDS CONFIRMATION'
-        : 'MONITORING';
+    record.product.watch = statusFor(record.product.purchaseDate || record.product.date);
+    record.product.monitoringStatus = monitoringStatusFor(record.product);
 
 
 
@@ -2864,7 +2899,7 @@ app.post('/api/monitor/products/:id/confirm-url', async (req, res) => {
 
       ok: true,
       message:
-        record.product.monitoringStatus === 'MONITORING'
+        record.product.monitoringStatus === 'ON WATCH'
           ? 'Product URL verified. Price monitoring is now active.'
           : 'Product URL verified. Confirm the purchase date to start monitoring.'
     });
@@ -2886,6 +2921,61 @@ app.post('/api/monitor/products/:id/confirm-url', async (req, res) => {
 });
 
 
+
+function applyConfirmedPurchaseDate(receipt, products, purchaseDate) {
+  const window = monitoringWindow(purchaseDate);
+  if (receipt) {
+    receipt.purchaseDate = purchaseDate;
+    receipt.purchaseDateConfirmed = true;
+    receipt.purchaseDateConfirmedByUser = true;
+    receipt.purchaseDateNeedsConfirmation = false;
+    const state = receiptDateState(purchaseDate);
+    receipt.status = state.status;
+    receipt.watch = state.watch;
+  }
+  for (const product of products) {
+    product.date = purchaseDate;
+    product.purchaseDate = purchaseDate;
+    product.purchaseDateConfirmed = true;
+    product.purchaseDateConfirmedByUser = true;
+    product.purchaseDateNeedsConfirmation = false;
+    product.monitoringStartDate = window.startDate;
+    product.monitoringExpirationDate = window.expirationDate;
+    product.monitoringStatus = monitoringStatusFor(product);
+  }
+}
+
+function scheduleDiscoveryAfterDateConfirmation(products) {
+  if (!products.some(product => monitoringStatusFor(product) === 'ON WATCH' &&
+    !(product.originalUrlVerified === true && product.url))) return;
+  runMonitoringWhenIdle().catch(error => {
+    console.error('Product discovery after purchase date confirmation failed:', sanitizeErrorText(error.message));
+  });
+}
+
+app.post('/api/receipts/:id/confirm-date', async (req, res) => {
+  const purchaseDate = req.body?.purchaseDate;
+  if (typeof purchaseDate !== 'string' || !isValidDateOnly(purchaseDate) ||
+      isFutureDateOnly(purchaseDate)) {
+    return res.status(400).json({ error: 'Choose a valid purchase date that is not in the future.' });
+  }
+  try {
+    const receipt = await withTrackingStoreLock(async () => {
+      const receipts = await readReceipts();
+      const item = receipts.find(entry => entry.id === req.params.id);
+      if (!item) return null;
+      applyConfirmedPurchaseDate(item, item.products || [], purchaseDate);
+      await writeReceipts(receipts);
+      return item;
+    });
+    if (!receipt) return res.status(404).json({ error: 'Receipt not found.' });
+    scheduleDiscoveryAfterDateConfirmation(receipt.products || []);
+    return res.json({ ok: true, message: 'Purchase date saved.', status: receiptStatusFor(receipt) });
+  } catch (error) {
+    console.error('Could not save receipt purchase date:', error.message);
+    return res.status(500).json({ error: 'Could not save the purchase date.' });
+  }
+});
 
 app.post('/api/monitor/products/:id/confirm-date', async (req, res) => {
 
@@ -2925,32 +3015,13 @@ app.post('/api/monitor/products/:id/confirm-date', async (req, res) => {
 
     }
 
-    const window = monitoringWindow(purchaseDate);
     const productsToUpdate = record.receipt
       ? record.receipt.products || []
       : [record.product];
-    if (record.receipt) {
-      record.receipt.purchaseDate = purchaseDate;
-      record.receipt.purchaseDateEvidence = purchaseDate;
-      record.receipt.purchaseDateConfirmedByUser = true;
-      record.receipt.purchaseDateNeedsConfirmation = false;
-    }
-    for (const product of productsToUpdate) {
-      product.date = purchaseDate;
-      product.purchaseDate = purchaseDate;
-      product.purchaseDateConfirmed = true;
-      product.purchaseDateConfirmedByUser = true;
-      product.purchaseDateNeedsConfirmation = false;
-      product.monitoringStartDate = window.startDate;
-      product.monitoringExpirationDate = window.expirationDate;
-      product.monitoringStatus = isWithinMonitoringWindow(purchaseDate)
-        ? product.originalUrlVerified === true
-          ? 'MONITORING'
-          : 'AWAITING PRODUCT URL'
-        : statusFor(purchaseDate);
-    }
+    applyConfirmedPurchaseDate(record.receipt, productsToUpdate, purchaseDate);
 
     await record.persist();
+    scheduleDiscoveryAfterDateConfirmation(productsToUpdate);
 
     res.json({
 
@@ -3117,13 +3188,13 @@ app.post('/api/monitor/products', async (req, res) => {
 
     monitoringExpirationDate: window.expirationDate,
 
-    monitoringStatus: 'MONITORING',
+    monitoringStatus: monitoringStatusFor({ purchaseDate: date }),
 
     purchaseDateConfirmed: !isFutureDateOnly(date),
 
     purchaseDateNeedsConfirmation: isFutureDateOnly(date),
 
-    discoveryStatus: url ? 'matched' : 'searching',
+    discoveryStatus: url ? 'found' : 'searching',
 
     matchConfidence: url ? 1 : 0,
 
@@ -3263,42 +3334,91 @@ async function retryPendingReceiptExtractions(receipts) {
         buffer,
         originalname: receipt.fileName,
         mimetype: receipt.mimeType
-      });
+      }, receipt.id);
       receipt.merchant = parsed.merchant;
-      receipt.purchaseDate = parsed.purchaseDate;
+      const userConfirmedDate = receipt.purchaseDateConfirmedByUser === true &&
+        isValidDateOnly(receipt.purchaseDate);
+      const purchaseDate = userConfirmedDate ? receipt.purchaseDate : parsed.purchaseDate;
+      receipt.purchaseDate = purchaseDate;
       receipt.purchaseDateEvidence = parsed.purchaseDateEvidence || null;
       receipt.total = parsed.total;
-      const confirmed = isValidDateOnly(parsed.purchaseDate) &&
-        !isFutureDateOnly(parsed.purchaseDate);
+      receipt.currency = parsed.currency;
+      const confirmed = isValidDateOnly(purchaseDate) &&
+        !isFutureDateOnly(purchaseDate);
       const needsConfirmation = receiptDateNeedsConfirmation(
-        parsed.purchaseDate,
-        receipt.uploadedAt
+        purchaseDate,
+        receipt.uploadedAt,
+        userConfirmedDate
       );
-      const dateState = receiptDateState(parsed.purchaseDate, now);
+      const dateState = receiptDateState(purchaseDate, now);
       receipt.purchaseDateConfirmed = confirmed;
       receipt.purchaseDateNeedsConfirmation = needsConfirmation;
-      receipt.purchaseDateConfirmedByUser = false;
+      receipt.purchaseDateConfirmedByUser = userConfirmedDate;
       receipt.watch = dateState.watch;
       receipt.status = dateState.status;
       receipt.products = createReceiptProducts(
         parsed,
-        parsed.purchaseDate,
+        purchaseDate,
         confirmed,
-        needsConfirmation
+        needsConfirmation,
+        userConfirmedDate
       );
       receipt.extractionStatus = 'complete';
       receipt.extractionMethod = `Groq (${OLLAMA_MODEL})`;
+      delete receipt.extractionReason;
       delete receipt.extractionMessage;
       delete receipt.nextExtractionRetryAt;
+      console.info('[receipt]', JSON.stringify({
+        event: 'receipt_updated',
+        receiptId: receipt.id,
+        extractionStatus: receipt.extractionStatus,
+        merchant: receipt.merchant,
+        purchaseDate: receipt.purchaseDate,
+        currency: receipt.currency,
+        products: receipt.products.length
+      }));
     } catch (error) {
-      receipt.extractionStatus = 'retry_pending';
-      receipt.extractionMessage = isGroqRateLimitError(error)
-        ? RATE_LIMIT_MESSAGE
-        : EXTRACTION_RETRY_MESSAGE;
-      receipt.nextExtractionRetryAt = new Date(
-        now.getTime() + RECEIPT_EXTRACTION_RETRY_MS
-      ).toISOString();
-      console.error(`Receipt extraction retry failed for ${receipt.id}:`, sanitizeErrorText(error.message, 'provider unavailable'));
+      const rateLimited = error instanceof GroqError &&
+        error.status === 429 &&
+        error.operation === 'receipt_extraction';
+      const failureReason = rateLimited
+        ? 'rate_limited'
+        : error instanceof GroqError
+          ? 'groq_error'
+          : 'extraction_error';
+      receipt.extractionStatus = 'failed';
+      receipt.extractionReason = failureReason;
+      receipt.extractionHttpStatus = error instanceof GroqError
+        ? error.status || null
+        : null;
+      receipt.extractionMessage = error.message || EXTRACTION_RETRY_MESSAGE;
+      receipt.status = 'EXTRACTION FAILED';
+      delete receipt.nextExtractionRetryAt;
+      if (error instanceof GroqError) {
+        console.error('[receipt]', JSON.stringify({
+          event: 'extraction_failed',
+          receiptId: receipt.id,
+          operation: error.operation,
+          reason: receipt.extractionReason,
+          status: error.status || null,
+          message: error.message,
+          responseBody: error.responseBody
+        }));
+      } else {
+        console.error('[receipt]', JSON.stringify({
+          event: 'extraction_failed',
+          receiptId: receipt.id,
+          reason: receipt.extractionReason,
+          status: null,
+          message: error.message,
+          responseBody: null
+        }));
+      }
+      console.info('[receipt]', JSON.stringify({
+        event: 'receipt_updated',
+        receiptId: receipt.id,
+        extractionStatus: receipt.extractionStatus
+      }));
     }
   }
 }
@@ -3321,7 +3441,7 @@ const receiptExtractionRetryScheduler = createReceiptExtractionRetryScheduler({
 
 
 
-async function monitorPrices() {
+async function monitorPrices({ manual = false } = {}) {
 
   if (checking) {
 
@@ -3346,6 +3466,10 @@ async function monitorPrices() {
 
 
   const results = [];
+  let productsSearched = 0;
+  const searchedProductIds = new Set();
+  const discoverySearchCache = new Map();
+  let earliestNextDiscovery = null;
 
 
 
@@ -3411,29 +3535,41 @@ async function monitorPrices() {
 
       const now = new Date();
 
-      const activeWindow = isWithinMonitoringWindow(
-        product.date || receipt.purchaseDate,
-        now
-      );
-      if (shouldAutomaticallyDiscoverProduct(
-        product,
+      const activeWindow = monitoringStatusFor(product, now) === 'ON WATCH';
+      product.monitoringStatus = monitoringStatusFor(product, now);
+      if (product.originalUrlVerified !== true && hasMonitorableUrl(product) && !product.urlSavedAt) {
+        product.urlSavedAt = product.lastProductDiscoveryAt || now.toISOString();
+      }
+      const lastDiscovery = Date.parse(product.lastProductDiscoveryAt || '');
+      const existingNextDiscovery = Date.parse(product.nextProductDiscoveryAt || '');
+      if (product.originalUrlVerified !== true && Number.isFinite(lastDiscovery) &&
+        (!Number.isFinite(existingNextDiscovery) ||
+          existingNextDiscovery < lastDiscovery + PRODUCT_DISCOVERY_INTERVAL_MS)) {
+        product.nextProductDiscoveryAt = new Date(
+          lastDiscovery + PRODUCT_DISCOVERY_INTERVAL_MS
+        ).toISOString();
+      }
+      const discoveryProduct = manual
+        ? { ...product, nextProductDiscoveryAt: null }
+        : product;
+      if (!activeDiscoveries.has(product.id) && !searchedProductIds.has(product.id) &&
+        shouldAutomaticallyDiscoverProduct(
+        discoveryProduct,
         product.date || receipt.purchaseDate,
         now
       )) {
 
         const nextDiscovery = Date.parse(product.nextProductDiscoveryAt || '');
-        if (!Number.isFinite(nextDiscovery) || now.getTime() >= nextDiscovery) {
+        if (manual || !Number.isFinite(nextDiscovery) || now.getTime() >= nextDiscovery) {
+          searchedProductIds.add(product.id);
+          productsSearched++;
           product.lastProductDiscoveryAttemptAt = now.toISOString();
-            product.discoveryStatus = 'searching';
-            product.monitoringStatus = isWithinMonitoringWindow(
-              product.date || receipt.purchaseDate,
-              now
-            )
-              ? 'SEARCHING FOR PRODUCT URL'
-              : monitoringStatusFor(product, now);
-            product.nextProductDiscoveryAt = new Date(
-              now.getTime() + MONITOR_INTERVAL_MS
-            ).toISOString();
+          product.lastProductDiscoveryAt = now.toISOString();
+          product.productDiscoveryError = null;
+          product.discoveryStatus = 'searching';
+          product.nextProductDiscoveryAt = new Date(
+            now.getTime() + PRODUCT_DISCOVERY_INTERVAL_MS
+          ).toISOString();
 
           activeDiscoveries.add(product.id);
           try {
@@ -3441,18 +3577,18 @@ async function monitorPrices() {
             if (product.url) {
               await verifyOriginalProductUrl(product);
             } else {
-              await discoverOriginalListing(product);
+              await discoverOriginalListing(product, persistStores, discoverySearchCache);
             }
           } catch (error) {
             product.discoveryStatus = product.url ? 'found' : 'awaiting_url';
             product.productDiscoveryError = sanitizeErrorText(error.message);
-            product.lastError = null;
+            product.lastError = product.productDiscoveryError;
 
             product.discoveryMessage = product.url
               ? 'The product page was found. Product identity and price verification will retry automatically.'
               : 'The agent could not verify the product page yet. It will continue searching automatically. You may paste the product URL as a fallback.';
 
-            product.monitoringStatus = product.url ? 'URL FOUND' : 'AWAITING PRODUCT URL';
+            product.monitoringStatus = monitoringStatusFor(product, now);
 
           } finally {
             activeDiscoveries.delete(product.id);
@@ -3464,10 +3600,22 @@ async function monitorPrices() {
 
       }
 
+      const nextDiscoveryAt = Date.parse(product.nextProductDiscoveryAt || '');
+      if (Number.isFinite(nextDiscoveryAt) &&
+        shouldAutomaticallyDiscoverProduct(
+          { ...product, nextProductDiscoveryAt: null },
+          product.date || receipt.purchaseDate,
+          now
+        ) &&
+        (earliestNextDiscovery === null || nextDiscoveryAt < earliestNextDiscovery)) {
+        earliestNextDiscovery = nextDiscoveryAt;
+      }
+
       if (activeWindow && product.originalUrlVerified === true) {
         await refreshAlternativeOffers(product, now, persistStores);
       }
 
+      const discoveryError = product.discoveryStatus === 'blocked' ? product.lastError : null;
       const monitoringResult = await checkMonitoredProduct({
 
         product,
@@ -3480,7 +3628,7 @@ async function monitorPrices() {
 
         fetchVerifiedPrice: url => fetchPrice(
           url,
-          product.officialRetailerDomain || new URL(url).hostname
+          product.officialRetailerDomain || knownRetailerDomain(product.retailer) || new URL(url).hostname
         ),
 
         sendNotification: (trackedProduct, details) => {
@@ -3493,16 +3641,17 @@ async function monitorPrices() {
         persist: persistStores
 
       });
+      if (discoveryError) product.lastError = discoveryError;
 
       if (
         monitoringResult.status === 'SEARCHING FOR PRODUCT URL' ||
-        monitoringResult.status === 'URL FOUND' ||
+        monitoringResult.status === 'URL FOUND' && !hasMonitorableUrl(product) ||
         monitoringResult.status === 'URL VERIFIED' ||
         monitoringResult.status === 'AWAITING PRODUCT URL'
       ) {
-        product.nextCheckAt = product.nextProductDiscoveryAt || null;
+        product.nextCheckAt = null;
       } else if (
-        ['WATCH EXPIRED', 'PURCHASE DATE NEEDS CONFIRMATION'].includes(
+        ['OFF WATCH', 'PURCHASE DATE NEEDS CONFIRMATION'].includes(
           monitoringResult.status
         )
 
@@ -3510,13 +3659,9 @@ async function monitorPrices() {
 
         product.nextCheckAt = null;
 
-      } else if (monitoringResult.checked) {
-
-        product.nextCheckAt = nextScheduledCheckAt;
-
       }
 
-      product.watch = monitoringResult.status === 'WATCH EXPIRED'
+      product.watch = monitoringResult.status === 'OFF WATCH'
         ? 'WATCH EXPIRED'
         : statusFor(product.date || receipt.purchaseDate);
 
@@ -3536,7 +3681,8 @@ async function monitorPrices() {
 
             : monitoringResult.status,
 
-        monitoringStatus: monitoringResult.status,
+        monitoringStatus: product.monitoringStatus,
+        priceStatus: priceStatusFor(product, now),
 
         currentPrice: product.currentVerifiedPrice,
 
@@ -3545,15 +3691,16 @@ async function monitorPrices() {
       } catch (error) {
         console.error(`Price monitoring failed for ${product.name || product.id}:`, error.message);
         product.lastError = 'This product could not be checked. The agent will continue and retry automatically.';
-        product.monitoringStatus = product.url && product.originalUrlVerified === true
+        product.priceStatus = product.url && product.originalUrlVerified === true
           ? 'PRICE UNAVAILABLE'
           : product.discoveryStatus === 'found' && product.url
             ? 'URL FOUND'
             : 'AWAITING PRODUCT URL';
         results.push({
           product: product.name || product.id,
-          status: product.monitoringStatus,
-          monitoringStatus: product.monitoringStatus,
+          status: product.priceStatus,
+          monitoringStatus: monitoringStatusFor(product),
+          priceStatus: product.priceStatus,
           currentPrice: product.currentVerifiedPrice ?? null,
           reason: product.lastError
         });
@@ -3567,6 +3714,12 @@ async function monitorPrices() {
 
 
 
+    console.info('[product-discovery]', JSON.stringify({
+      event: 'discovery_cycle_finished',
+      productsSearched,
+      nextProductDiscoveryAt: earliestNextDiscovery === null
+        ? null : new Date(earliestNextDiscovery).toISOString()
+    }));
     return {
 
       ok: true,
@@ -3595,7 +3748,7 @@ app.post('/api/monitor/run', async (_, res) => {
 
   try {
 
-    const result = await monitorPrices();
+    const result = await monitorPrices({ manual: true });
 
     res
 
@@ -3923,6 +4076,11 @@ app.get('/api/agent/status', async (_, res) => {
 
 const server = app.listen(PORT, '127.0.0.1', () => {
 
+  console.log({
+    groqKeyLoaded: Boolean(process.env.GROQ_API_KEY),
+    groqModel: OLLAMA_MODEL
+  });
+
   console.log(
 
     `PriceDrop Agent API running on http\://127.0.0.1:${PORT}`
@@ -3945,7 +4103,7 @@ const server = app.listen(PORT, '127.0.0.1', () => {
 
         : 'not configured'
 
-    } | Price monitoring interval: ${MONITOR_INTERVAL_MINUTES} minutes | Public product discovery interval: ${ALTERNATIVE_DISCOVERY_INTERVAL_MS / (60 * 60 * 1000)} hours`
+    } | Price monitoring interval: ${PRICE_CHECK_INTERVAL_HOURS} hours | Public product discovery interval: ${PRODUCT_DISCOVERY_INTERVAL_MS / (60 * 60 * 1000)} hours`
 
   );
 

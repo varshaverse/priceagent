@@ -6,6 +6,8 @@ import {
 } from 'lucide-react';
 import './style.css';
 import './monitor.css';
+import { mostRecentlyUploadedReceipt, receiptWatchLabel } from './receipt-view.js';
+import { monitoringBadgeClass } from './monitor-view.js';
 
 const money = value => value == null || value === ''
   ? '—'
@@ -38,21 +40,19 @@ const friendlyError = value => {
   return text;
 };
 
-const displayStatus = product => {
-  const status = product.monitoringStatus || 'AWAITING PRODUCT URL';
-  if (['PURCHASE DATE NEEDS CONFIRMATION', 'WATCH EXPIRED'].includes(status)) return status;
-  if (!product.originalUrlVerified || !product.url) {
-    if (product.discoveryStatus === 'found' && product.url) return 'URL FOUND';
-    return product.discoveryStatus === 'searching' || status === 'SEARCHING FOR PRODUCT URL'
-      ? 'SEARCHING FOR PRODUCT URL'
-      : 'AWAITING PRODUCT URL';
-  }
-  if (status === 'PRICE DROP DETECTED' || status === 'PRICE UNAVAILABLE') return status;
-  return product.lastCheckedAt && product.currentVerifiedPrice != null ? 'WATCH' : 'URL VERIFIED';
+const discoveryLabel = product => {
+  if (product.originalUrlVerified && product.url) return 'URL VERIFIED';
+  if (product.url) return 'URL SAVED · IDENTITY UNVERIFIED';
+  if (product.monitoringStatus === 'PURCHASE DATE NEEDS CONFIRMATION') return 'PAUSED · DATE NEEDED';
+  if (product.monitoringStatus === 'OFF WATCH') return 'PAUSED · OFF WATCH';
+  if (product.discoveryStatus === 'searching') return 'SEARCHING';
+  if (product.discoveryStatus === 'blocked') return 'BLOCKED';
+  if (product.discoveryStatus === 'queued') return 'QUEUED';
+  return 'AWAITING PRODUCT URL';
 };
 
 const receiptStatusLabel = receipt =>
-  receipt.extractionStatus === 'retry_pending' ? 'EXTRACTING' : receipt.status;
+  receiptWatchLabel(receipt);
 
 function App() {
   const [receipts, setReceipts] = useState([]);
@@ -92,6 +92,7 @@ function App() {
   const latestLoadId = useRef(0);
   const [notice, setNotice] = useState('');
   const [file, setFile] = useState(null);
+  const [receiptPurchaseDate, setReceiptPurchaseDate] = useState('');
   const [manualProduct, setManualProduct] = useState({
     name: '',
     retailer: '',
@@ -105,17 +106,16 @@ function App() {
 
   async function load() {
     const loadId = ++latestLoadId.current;
+    loadAiStatus(loadId);
     try {
-      const [receiptResponse, productResponse, healthResponse] = await Promise.all([
+      const [receiptResponse, productResponse] = await Promise.all([
         fetch('/api/receipts'),
-        fetch('/api/monitor/products'),
-        fetch('/api/health')
+        fetch('/api/monitor/products')
       ]);
 
-      const [receiptData, productData, healthData] = await Promise.all([
+      const [receiptData, productData] = await Promise.all([
         receiptResponse.json(),
-        productResponse.json(),
-        healthResponse.json()
+        productResponse.json()
       ]);
 
       if (!receiptResponse.ok) throw new Error(receiptData.error || 'Could not load receipts.');
@@ -133,14 +133,6 @@ function App() {
         priceDropsDetected: 0
       });
 
-      setAiStatus({
-        provider: healthData.aiProvider || 'ollama',
-        model: healthData.aiModel || 'qwen/qwen3.8-27b',
-        connected: Boolean(healthData.aiConnected),
-        modelAvailable: Boolean(healthData.aiModelAvailable),
-        error: healthData.aiError || ''
-      });
-
       setNotice(current =>
         current === BACKEND_UNAVAILABLE_NOTICE ? '' : current
       );
@@ -148,11 +140,11 @@ function App() {
       setTestProductId(current =>
         current && products.some(product =>
           product.id === current &&
-          !['WATCH EXPIRED', 'PURCHASE DATE NEEDS CONFIRMATION'].includes(product.monitoringStatus)
+          product.monitoringStatus === 'ON WATCH'
         )
           ? current
           : products.find(product =>
-            !['WATCH EXPIRED', 'PURCHASE DATE NEEDS CONFIRMATION'].includes(product.monitoringStatus)
+            product.monitoringStatus === 'ON WATCH'
           )?.id || ''
       );
       return true;
@@ -161,6 +153,30 @@ function App() {
         setNotice(BACKEND_UNAVAILABLE_NOTICE);
       }
       return false;
+    }
+  }
+
+  async function loadAiStatus(loadId) {
+    try {
+      const response = await fetch('/api/health');
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Could not load AI provider status.');
+      if (loadId !== latestLoadId.current) return;
+      setAiStatus({
+        provider: data.aiProvider || 'groq',
+        model: data.aiModel || 'qwen/qwen3.8-27b',
+        connected: Boolean(data.aiConnected),
+        modelAvailable: Boolean(data.aiModelAvailable),
+        error: data.aiError || ''
+      });
+    } catch (error) {
+      if (loadId !== latestLoadId.current) return;
+      setAiStatus(current => ({
+        ...current,
+        connected: false,
+        modelAvailable: false,
+        error: error.message
+      }));
     }
   }
 
@@ -236,10 +252,11 @@ function App() {
   const emailConfigured = gmailStatus.connected && savedEmailRecipients.length > 0;
 
   const activeTrackedProducts = trackedProducts.filter(
-    product => !['WATCH EXPIRED', 'PURCHASE DATE NEEDS CONFIRMATION'].includes(product.monitoringStatus)
+    product => product.monitoringStatus === 'ON WATCH'
   );
 
   const activeReceipts = receipts.filter(receipt => receipt.status === 'WATCH');
+  const latestReceipt = mostRecentlyUploadedReceipt(receipts);
   const drops = monitorStats.priceDropsDetected;
 
   const filteredTrackedProducts = useMemo(() => trackedProducts.filter(product =>
@@ -268,6 +285,7 @@ function App() {
     try {
       const formData = new FormData();
       formData.append('receipt', file);
+      if (receiptPurchaseDate) formData.append('purchaseDate', receiptPurchaseDate);
 
       const response = await fetch('/api/receipts/upload', {
         method: 'POST',
@@ -280,6 +298,7 @@ function App() {
 
       setShowUpload(false);
       setFile(null);
+      setReceiptPurchaseDate('');
       const dashboardRefreshed = await load();
       setNotice(dashboardRefreshed
         ? data.message || 'Receipt uploaded successfully. Dashboard data refreshed.'
@@ -521,8 +540,10 @@ function App() {
 
       await load();
       setNotice(data.message);
+      return true;
     } catch (error) {
       setNotice(friendlyError(error.message));
+      return false;
     } finally {
       setBusy(false);
     }
@@ -547,6 +568,27 @@ function App() {
 
       if (!response.ok) throw new Error(data.error || 'Could not confirm purchase date.');
 
+      await load();
+      setNotice(data.message);
+      return true;
+    } catch (error) {
+      setNotice(friendlyError(error.message));
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveReceiptDate(id, purchaseDate) {
+    setBusy(true);
+    try {
+      const response = await fetch(`/api/receipts/${id}/confirm-date`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ purchaseDate })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Could not save purchase date.');
       await load();
       setNotice(data.message);
       return true;
@@ -637,10 +679,10 @@ function App() {
         <section className="stats">
           <Stat title="Receipts uploaded" value={receipts.length} detail="Saved in your portal" icon={<PackageCheck size={18}/>} tone="purple"/>
           <Stat title="Receipts on watch" value={activeReceipts.length} detail="Purchased less than 30 days ago" icon={<Eye size={18}/>} tone="green"/>
-          <Stat title="Products monitored" value={monitorStats.monitored} detail="Within the 30-day window" icon={<Activity size={18}/>} tone="purple"/>
+          <Stat title="Products monitored" value={monitorStats.monitored} detail="Eligible products, including those awaiting their first check" icon={<Activity size={18}/>} tone="purple"/>
           <Stat title="Verified product URLs" value={monitorStats.withVerifiedUrls} detail="Official retailer pages" icon={<ShieldCheck size={18}/>} tone="green"/>
           <Stat title="Prices unavailable" value={monitorStats.pricesUnavailable} detail="Live price not verified" icon={<Clock3 size={18}/>} tone="orange"/>
-          <Stat title="Price drops detected" value={drops} detail="Verified original-retailer prices only" icon={<Bell size={18}/>} tone="orange"/>
+          <Stat title="Price drops detected" value={drops} detail="Retailer prices; product identity may be unverified" icon={<Bell size={18}/>} tone="orange"/>
         </section>
 
         <section className="how-panel">
@@ -656,12 +698,12 @@ function App() {
 
         <section className="receipts-section">
           <div className="section-heading">
-            <div><h2>Recent receipts</h2><p>Upload receipts or add a product directly to the monitor.</p></div>
+            <div><h2>Latest receipt</h2><p>Earlier uploads remain in your receipt portal.</p></div>
             <button className="secondary" onClick={() => setPage('monitor')}>Open price monitor</button>
           </div>
 
           {receipts.length
-            ? <ReceiptList receipts={receipts.slice(0, 3)} onDelete={deleteReceipt} deletingReceiptId={deletingReceiptId}/>
+            ? <ReceiptList receipts={latestReceipt ? [latestReceipt] : []} onDelete={deleteReceipt} deletingReceiptId={deletingReceiptId} onSaveDate={saveReceiptDate} busy={busy}/>
             : <Empty
                 icon={<Upload size={24}/>}
                 title="Your receipt portal is ready"
@@ -681,7 +723,7 @@ function App() {
         </div>
 
         {filteredReceipts.length
-          ? <ReceiptList receipts={filteredReceipts} onDelete={deleteReceipt} deletingReceiptId={deletingReceiptId}/>
+          ? <ReceiptList receipts={filteredReceipts} onDelete={deleteReceipt} deletingReceiptId={deletingReceiptId} onSaveDate={saveReceiptDate} busy={busy}/>
           : <Empty
               icon={<Upload size={24}/>}
               title={receipts.length ? 'No matching receipts' : 'No receipts yet'}
@@ -851,6 +893,17 @@ function App() {
             </div>
           </label>
 
+          <label>
+            Purchase date <span>(optional)</span>
+            <input
+              type="date"
+              max={localToday()}
+              value={receiptPurchaseDate}
+              onChange={event => setReceiptPurchaseDate(event.target.value)}
+            />
+            <small>Enter the date printed on the receipt. If provided, it takes precedence over the extracted date.</small>
+          </label>
+
           <div className="auto-note">
             <ShieldCheck size={17}/>
             <div>
@@ -866,7 +919,7 @@ function App() {
           </div>
 
           <div className="modal-actions">
-            <button type="button" className="secondary" onClick={() => { setShowUpload(false); setFile(null); }}>
+            <button type="button" className="secondary" onClick={() => { setShowUpload(false); setFile(null); setReceiptPurchaseDate(''); }}>
               Cancel
             </button>
             <button className="primary" disabled={busy || !file}>
@@ -1018,7 +1071,21 @@ function Empty({ icon, title, text, action }) {
   </div>;
 }
 
-function ReceiptList({ receipts, onDelete, deletingReceiptId }) {
+function ReceiptDatePrompt({ receipt, onSaveDate, busy }) {
+  const [date, setDate] = useState('');
+  return <div className="product-confirmation">
+    <label>
+      Purchase date on receipt
+      <input type="date" max={localToday()} value={date} onChange={event => setDate(event.target.value)}/>
+    </label>
+    <button className="secondary" disabled={busy || !date} onClick={() => onSaveDate(receipt.id, date)}>
+      Save purchase date
+    </button>
+    <span>The date could not be read clearly. Enter it to determine whether this purchase is on watch.</span>
+  </div>;
+}
+
+function ReceiptList({ receipts, onDelete, deletingReceiptId, onSaveDate, busy }) {
   return <div className="receipt-list">
     {receipts.map(receipt =>
       <article className="receipt-card" key={receipt.id}>
@@ -1050,17 +1117,19 @@ function ReceiptList({ receipts, onDelete, deletingReceiptId }) {
 
         {receipt.extractionMessage && <p className="pending-text">{friendlyError(receipt.extractionMessage)}</p>}
 
+        {receipt.extractionStatus === 'complete' && receipt.purchaseDateNeedsConfirmation &&
+          <ReceiptDatePrompt receipt={receipt} onSaveDate={onSaveDate} busy={busy}/>}
+
         {(receipt.products || []).length > 0 && <div className="product-list">
           {receipt.products.map(product => {
             const purchasePrice = Number(product.purchasePrice ?? product.price);
 
-            const currentPrice = product.originalUrlVerified === true &&
-              product.currentVerifiedPrice != null &&
+            const currentPrice = product.currentVerifiedPrice != null &&
               Number.isFinite(Number(product.currentVerifiedPrice))
               ? Number(product.currentVerifiedPrice)
               : null;
 
-            const hasVerifiedDrop = product.monitoringStatus === 'PRICE DROP DETECTED' &&
+            const hasVerifiedDrop = product.priceStatus === 'PRICE DROP DETECTED' &&
               currentPrice != null &&
               currentPrice < purchasePrice &&
               Boolean(product.lastCheckedAt);
@@ -1070,25 +1139,25 @@ function ReceiptList({ receipts, onDelete, deletingReceiptId }) {
 
               <div className="product-info">
                 <b>{product.product || product.name}</b>
-                <small>Purchase date: {displayPurchaseDate(product.date || receipt.purchaseDate, product.purchaseDateNeedsConfirmation)} · Status: <strong>{displayStatus(product)}</strong></small>
+                <small>Purchase date: {displayPurchaseDate(product.date || receipt.purchaseDate, product.purchaseDateNeedsConfirmation)} · Watch: <strong>{product.monitoringStatus}</strong> · Product URL: <strong>{discoveryLabel(product)}</strong></small>
                 {product.purchaseDateNeedsConfirmation && (
-                  <small className="pending-text">Confirm the purchase date in Price monitor to enable price monitoring. Product-page discovery can still continue.</small>
+                  <small className="pending-text">Enter the purchase date above to start product discovery and price monitoring if the purchase is on watch.</small>
                 )}
                 <small>
                   {product.originalUrlVerified && product.url
                     ? <a href={product.url} target="_blank" rel="noreferrer">Verified product page <ExternalLink size={11}/></a>
-                    : product.discoveryStatus === 'found' && product.url
-                      ? <a href={product.url} target="_blank" rel="noreferrer">Product page found · verification pending <ExternalLink size={11}/></a>
+                    : product.url
+                      ? <a href={product.url} target="_blank" rel="noreferrer">Product link saved · identity unverified <ExternalLink size={11}/></a>
                     : 'No verified product URL'}
                   {product.lastCheckedAt && ` · Checked ${new Date(product.lastCheckedAt).toLocaleString()}`}
                 </small>
-                {!product.originalUrlVerified && product.discoveryStatus === 'searching' && (
+                {product.monitoringStatus === 'ON WATCH' && !product.originalUrlVerified && product.discoveryStatus === 'searching' && (
                   <small>Searching {receipt.merchant || product.retailer || 'the retailer'} for the product page automatically…</small>
                 )}
-                {!product.originalUrlVerified && product.discoveryStatus === 'queued' && receipt.status !== 'WATCH EXPIRED' && (
+                {product.monitoringStatus === 'ON WATCH' && !product.originalUrlVerified && product.discoveryStatus === 'queued' && (
                   <small>Product-page search is queued for {receipt.merchant || product.retailer || 'the retailer'}.</small>
                 )}
-                {!product.originalUrlVerified && product.discoveryStatus === 'awaiting_url' && receipt.status !== 'WATCH EXPIRED' && (
+                {product.monitoringStatus === 'ON WATCH' && !product.url && !product.originalUrlVerified && ['awaiting_url', 'blocked'].includes(product.discoveryStatus) && (
                   <small>No product page found yet. {product.nextProductDiscoveryAt
                     ? `Next search: ${new Date(product.nextProductDiscoveryAt).toLocaleString()}.`
                     : 'The agent will retry automatically.'} You can also add the URL in Price monitor.</small>
@@ -1129,6 +1198,7 @@ function TrackedProduct({
     product.monitoringStatus === 'PURCHASE DATE NEEDS CONFIRMATION'
   );
   const [urlDraft, setUrlDraft] = useState(product.url || '');
+  const [urlEditorOpen, setUrlEditorOpen] = useState(false);
 
   useEffect(() => {
     const value = product.purchaseDate || product.date || '';
@@ -1152,27 +1222,25 @@ function TrackedProduct({
     .filter(offer => offer.verified === true)
     .sort((left, right) => Number(left.price) - Number(right.price));
 
-  const status = product.monitoringStatus || 'AWAITING PRODUCT URL';
+  const status = product.monitoringStatus || 'PURCHASE DATE NEEDS CONFIRMATION';
+  const priceStatus = product.priceStatus;
 
-  const verifiedCurrentPrice = product.originalUrlVerified === true &&
-    product.currentVerifiedPrice != null &&
+  const verifiedCurrentPrice = product.currentVerifiedPrice != null &&
     Number.isFinite(Number(product.currentVerifiedPrice))
     ? Number(product.currentVerifiedPrice)
     : null;
 
-  const validDrop = status === 'PRICE DROP DETECTED' &&
+  const validDrop = status === 'ON WATCH' && priceStatus === 'PRICE DROP DETECTED' &&
     verifiedCurrentPrice != null &&
     verifiedCurrentPrice < Number(product.purchasePrice) &&
     Boolean(product.lastCheckedAt);
 
-  const statusClass = validDrop
-    ? 'drop'
-    : status === 'PRICE UNAVAILABLE' ||
-      status === 'PURCHASE DATE NEEDS CONFIRMATION'
-      ? 'unavailable'
-      : status === 'WATCH EXPIRED'
-        ? 'expired'
-        : 'monitoring';
+  const statusClass = monitoringBadgeClass({
+    status,
+    priceStatus,
+    url: product.url,
+    validDrop
+  });
 
   const formatDateTime = value => value ? new Date(value).toLocaleString() : 'Not checked yet';
   const percent = product.savingsPercent ?? product.priceDropSavingsPercent;
@@ -1186,20 +1254,20 @@ function TrackedProduct({
       <div className="product-info">
         <b>{product.name || product.product}</b>
         <small>{product.merchant || product.retailer || 'Retailer'} · Purchased {displayPurchaseDate(product.purchaseDate || product.date, status === 'PURCHASE DATE NEEDS CONFIRMATION')}</small>
-        <small>{product.monitoringStartDate || 'Start pending'} through {product.monitoringExpirationDate || 'Expiration pending'} · {status === 'WATCH EXPIRED' ? 'watch period expired' : `${product.daysRemaining} day${product.daysRemaining === 1 ? '' : 's'} remaining`}</small>
+        <small>{product.monitoringStartDate || 'Start pending'} through {product.monitoringExpirationDate || 'Expiration pending'} · {status === 'OFF WATCH' ? 'watch period expired' : `${product.daysRemaining} day${product.daysRemaining === 1 ? '' : 's'} remaining`}</small>
+        <small>Product URL: <strong>{product.originalUrlVerified && product.url ? 'VERIFIED' : discoveryLabel(product)}</strong></small>
+        {status === 'ON WATCH' && priceStatus === 'PRICE UNAVAILABLE' && <small>Price status: unavailable</small>}
 
         {product.originalUrlVerified && product.url
           ? <small><a href={product.url} target="_blank" rel="noreferrer">URL VERIFIED · Original retailer page <ExternalLink size={11}/></a></small>
-          : product.discoveryStatus === 'found' && product.url
-            ? <small><a href={product.url} target="_blank" rel="noreferrer">URL FOUND · Identity and price verification will retry <ExternalLink size={11}/></a></small>
           : product.url
-            ? <small>Submitted URL is not verified: <a href={product.url} target="_blank" rel="noreferrer">Review page <ExternalLink size={11}/></a></small>
+            ? <small><a href={product.url} target="_blank" rel="noreferrer">URL SAVED · Product identity unverified <ExternalLink size={11}/></a></small>
             : <small>No verified original retailer URL</small>}
 
-        {!product.originalUrlVerified && product.discoveryStatus === 'searching' && (
+        {status === 'ON WATCH' && !product.originalUrlVerified && product.discoveryStatus === 'searching' && (
           <small>SEARCHING FOR PRODUCT URL · Searching the {product.merchant || product.retailer || 'retailer'} website automatically.</small>
         )}
-        {!product.originalUrlVerified && product.discoveryStatus === 'queued' && status !== 'WATCH EXPIRED' && (
+        {status === 'ON WATCH' && !product.originalUrlVerified && product.discoveryStatus === 'queued' && (
           <small>Product-page search is queued for {product.merchant || product.retailer || 'the retailer'}.</small>
         )}
 
@@ -1207,7 +1275,7 @@ function TrackedProduct({
       </div>
 
       <span className={`monitoring-badge ${statusClass}`}>
-        {validDrop ? 'PRICE DROP DETECTED' : status}
+        {status}
       </span>
 
       <div className="price-col">
@@ -1236,6 +1304,7 @@ function TrackedProduct({
 
     <div className="monitor-details">
       <span>Last checked: <b>{formatDateTime(product.lastCheckedAt)}</b></span>
+      {product.currentPriceSource === 'Costco warehouse price' && <span>Price source: <b>Costco warehouse price · may vary by location</b></span>}
       <span>Next check: <b>{product.nextCheckAt ? formatDateTime(product.nextCheckAt) : 'Not scheduled'}</b></span>
       <span>Previous verified: <b>{money(product.previousVerifiedPrice)}</b></span>
       <span>Lowest verified: <b>{money(product.lowestVerifiedPrice)}</b></span>
@@ -1250,7 +1319,7 @@ function TrackedProduct({
       <p className="monitor-error">{friendlyError(product.lastError)}</p>
     )}
 
-    {product.discoveryMessage && !product.originalUrlVerified && (
+    {product.discoveryMessage && status === 'ON WATCH' && !product.originalUrlVerified && !product.url && (
       <p className="pending-text">{product.discoveryMessage}</p>
     )}
 
@@ -1277,7 +1346,11 @@ function TrackedProduct({
       )}
     </div>}
 
-    {!product.originalUrlVerified && (
+    {product.url && !urlEditorOpen && (
+      <button className="secondary" onClick={() => setUrlEditorOpen(true)}>Edit URL</button>
+    )}
+
+    {(!product.url || urlEditorOpen) && (
       <div className="product-confirmation">
         <label>
           Product URL
@@ -1290,43 +1363,33 @@ function TrackedProduct({
         </label>
 
         <div className="confirmation-actions">
-          <button
+          {!product.originalUrlVerified && <button
             className="secondary"
-            disabled={busy}
+            disabled={busy || status !== 'ON WATCH'}
             onClick={() => onDiscover(product.id)}
           >
             {product.discoveryStatus === 'needs_confirmation'
               ? 'Search again'
               : 'Let agent search again'}
-          </button>
+          </button>}
 
           <button
             className="primary"
             disabled={busy || !urlDraft.trim()}
-            onClick={() => onConfirmUrl(product.id, urlDraft.trim())}
+            onClick={async () => {
+              if (await onConfirmUrl(product.id, urlDraft.trim())) setUrlEditorOpen(false);
+            }}
           >
             Save product URL
           </button>
+          {product.url && <button className="secondary" onClick={() => setUrlEditorOpen(false)}>Cancel</button>}
         </div>
 
         <span>
-          If the agent cannot find the page, paste the product URL here.
-          The agent will keep verifying and monitoring it automatically.
+          The link must belong to the original retailer. Product identity may remain unverified.
         </span>
       </div>
     )}
-
-    {(product.discoveryCandidates || []).length > 1 && <div className="product-confirmation candidate-list">
-      <b>URL FOUND · Confirm the matching {product.retailer || 'retailer'} listing</b>
-
-      {product.discoveryCandidates.map(candidate => <div key={candidate.url}>
-        <span>{candidate.title}{candidate.priceVerified ? ` · ${money(candidate.price)}` : ' · Current price unavailable'}</span>
-        <a href={candidate.url} target="_blank" rel="noreferrer">Review listing <ExternalLink size={11}/></a>
-        <button className="secondary" disabled={busy} onClick={() => onConfirmUrl(product.id, candidate.url)}>
-          Use this listing
-        </button>
-      </div>)}
-    </div>}
 
     {history.length > 0 && <div className="price-history">
       <b>Verified price history</b>
@@ -1368,13 +1431,14 @@ function TrackedProduct({
     </p>}
 
     {notifications.length > 0 && <div className="notification-history">
-      <b>Email notification history</b>
+      <b>Price-drop notifications</b>
 
       {notifications.map((item, index) => <span
         key={`${item.detectedAt}-${index}`}
         className={`notification-event ${item.status}`}
       >
-        {item.status.toUpperCase()} · {money(item.price)} · {item.sentAt ? formatDateTime(item.sentAt) : formatDateTime(item.detectedAt)}
+        {item.productName || product.name} · {item.retailer || product.retailer || product.merchant} · Purchased {money(item.purchasePrice ?? product.purchasePrice)} · Current {money(item.price)} · Save {money(item.savings)} ({Number(item.savingsPercent || 0).toFixed(1)}%) · Checked {formatDateTime(item.detectedAt)} · Email {item.status.toUpperCase()}{item.productIdentityVerified === false ? ' · Product identity unverified' : ''}{item.priceSource === 'Costco warehouse price' ? ' · Warehouse price may vary by location' : ''}
+        {' · '}{item.url && <a href={item.url} target="_blank" rel="noreferrer">Product link <ExternalLink size={11}/></a>}
         {item.error ? ` · ${item.error}` : ''}
       </span>)}
     </div>}

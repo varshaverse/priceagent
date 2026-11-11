@@ -4,7 +4,7 @@ A React + Express app for tracking receipt purchases and monitoring live prices 
 
 ## Requirements
 
-- Node.js 20 or newer
+- Node.js 20.16 or newer (or a current Node.js LTS release)
 - A Groq API key and a supported Groq model
 - A Google OAuth 2.0 Web application for Gmail API sending
 
@@ -16,13 +16,15 @@ A React + Express app for tracking receipt purchases and monitoring live prices 
    npm install
    ```
 
-2. Create your local environment file:
+2. Create your local environment file (macOS/Linux):
 
    ```bash
    cp .env.example .env
    ```
 
-3. Configure `GROQ_API_KEY`, `GROQ_MODEL`, and the Google OAuth settings in `.env`. Set `ALERT_TO` as an optional initial recipient or manage multiple recipients later in Price monitor.
+   On Windows PowerShell, use `Copy-Item .env.example .env` instead.
+
+3. Configure `GROQ_API_KEY` and the Google OAuth settings in `.env`. Alternatively, export `GROQ_API_KEY` in your shell; an `.env` file is optional. Set `ALERT_TO` as an optional initial recipient or manage multiple recipients later in Price monitor. The backend uses `qwen/qwen3.8-27b` and the Groq SDK's default endpoint; legacy `GROQ_URL` settings are ignored.
 4. Start the app:
 
    ```bash
@@ -30,6 +32,8 @@ A React + Express app for tracking receipt purchases and monitoring live prices 
    ```
 
 5. Open the Vite URL shown in the terminal (normally http://localhost:5173).
+
+To start only the backend, run `npm run server` from the project root. It listens on http://127.0.0.1:4100 by default; no `source .env` command is needed.
 
 On the first development startup, the predev step installs Playwright Chromium if it is not already available. The backend uses Playwright directly because Copilot-hosted MCP tools are not available to the standalone Node.js process; product discovery and price checks therefore run without requiring Copilot to remain open.
 
@@ -77,7 +81,17 @@ Google OAuth apps left in Testing mode may have refresh tokens that expire after
 - `GET /api/email/settings` and `POST /api/email/settings` — read/update the persistent list of alert recipients (`PUT` remains supported).
 - `POST /api/email/test` — verifies Gmail authorization and sends a clearly labeled test email. Pass `{"productId":"..."}` to simulate a drop for an active tracked product, and/or `{"recipient":"someone@example.com"}` for a one-off destination; this does not change monitoring data.
 
-The backend runs an initial check on startup and then checks eligible products every `MONITOR_INTERVAL_MINUTES` (default 60; minimum 15 minutes). Retailer domains are resolved from each receipt's merchant, and product searches are restricted to that official domain. Discovery can run while a purchase date needs confirmation, but price monitoring and alerts remain paused. Searches are queued and processed individually; unsuccessful searches are retried when due, including after a restart. If discovery is unsuccessful, the receipt and product remain saved as **AWAITING PRODUCT URL**; the user can paste a URL and the backend retries verification. Separate alternative-retailer offers remain clearly distinct from original-retailer prices. Product windows, verified observations, discovered URLs, and notification history are persisted locally.
+The backend runs an initial check on startup and schedules checks every `PRICE_CHECK_INTERVAL_HOURS` (default and minimum 24 hours). Each product is checked at most once per local calendar day, including manual checks and after restarts; a manual check on a new day may run before 24 hours have elapsed. Original product discovery is separately scheduled using `PUBLIC_PRODUCT_DISCOVERY_INTERVAL_HOURS` (default 24 hours); persisted next-attempt times prevent early retries after restart. A manual **Run check** or individual discovery request can search immediately and resets that product's next scheduled discovery time. Retailer domains are resolved from each receipt's merchant, and product searches are restricted to that official domain. Verified URLs are saved automatically and may be edited later. Discovery only runs for purchases within the 30-day watch window with a clear or user-confirmed date. An unclear or missing date pauses discovery until confirmed; expired purchases are off watch and are not searched. The dashboard shows product URL discovery separately from the purchase-date status: **ON WATCH**, **OFF WATCH**, or **PURCHASE DATE NEEDS CONFIRMATION**. Price monitoring and alerts run only while on watch; price outcomes are exposed separately as `priceStatus`. A detected drop is saved in the dashboard before Gmail is attempted; a failed email is recorded without removing the notification. Each product/price pair generates at most one email attempt. Searches are processed individually and candidates are stored before verification. Costco searches that are blocked or return no results are reported as blocked; the user can paste a URL. Separate alternative-retailer offers remain clearly distinct from original-retailer prices. Product windows, verified observations, discovered URLs, and notification history are persisted locally.
+
+Costco product URLs do not have to follow a particular path format. The app still checks the official domain, product-page evidence, and product identity before marking a link verified. A saved official-retailer link whose identity is unverified can be checked starting on the next local calendar day, as long as the product is on watch and has a valid purchase price. Such links are labeled as identity-unverified in the dashboard and alerts; the retailer still must provide a verifiable price. Verification and price checks can fail if the retailer blocks access.
+
+Discovery automatically saves the first eligible official-retailer result, even if product identity cannot be verified, and stops searching after saving it. The saved link can be edited. A first result may be a different item, so check the link before relying on its price or alerts.
+
+When a Costco product page exposes an unambiguous dollar amount labeled **Warehouse Price**, it can be compared with the receipt purchase price. Warehouse prices may vary by location and differ from online prices; the dashboard and alerts identify this price source. Ambiguous amounts, unit prices, and discounts are not treated as warehouse prices.
+
+The dashboard displays the latest uploaded receipt; earlier receipts remain in the receipt portal and contribute to the totals. Receipts outside the 30-day window show **OFF WATCH**. If the printed date cannot be read, the date must be confirmed in Price monitor rather than inferred from the upload date. The products-monitored total counts products eligible for the watch window, including products awaiting their first price check.
+
+The receipt upload form also accepts an optional purchase date. When supplied, it overrides the extracted date and is saved as user-confirmed; otherwise the app uses the date read from the receipt. If the date is unclear, the receipt card asks for it and updates the watch status after it is saved. Future and invalid dates are rejected.
 
 ## Price-drop email behavior
 
@@ -100,7 +114,7 @@ Run the isolated, mocked monitoring tests with `npm test`. These tests use injec
 ## Important limitations
 
 - Product discovery and price checks use Playwright Chromium from the backend. Retailers that require sign-in, block automation, or change their search or page layout may not be detected. Use official retailer APIs where available and respect each site's terms.
-- The receipt picker accepts any file extension up to 10 MB. Images are normalized locally; PDFs are rasterized locally on macOS, and UTF-8 text is read directly. Receipt images/text are sent to Groq for extraction. If Groq returns HTTP 429, the original receipt is retained and extraction is retried later.
+- The receipt picker accepts files up to 10 MB. JPG, JPEG, PNG, and WebP images are normalized locally; PDFs of up to three pages are rasterized on Windows, macOS, or Linux, and UTF-8 text is read directly. Swift is not required. Receipt images/text are sent to Groq for extraction. Provider health uses a real request and is cached for one minute. HTTP 429 errors are retried during extraction; if retries are exhausted, the receipt is saved as `EXTRACTION FAILED`, as with other provider failures. Errors are logged with the receipt ID, operation, HTTP status, message, and response body.
 - Receipt uploads are optional. In Price monitor, add a product name, purchase price, and direct product URL to start a watch without uploading a receipt.
 - When a product URL is missing, discovery is restricted to the official website of the original retailer. A submitted URL is checked against that retailer before monitoring.
 - Price history records successful observations, but a retailer may block automated requests, render prices in JavaScript, require sign-in, or change its page structure. Verify any return eligibility and savings with the retailer.

@@ -74,7 +74,8 @@ export function candidateUrlRejectionReason(value, domain, title = '') {
   const navigationReason = navigationUrlRejectionReason(value, title);
   if (navigationReason) return navigationReason;
   const pathname = url.pathname.toLowerCase();
-  if (!PRODUCT_PATH.test(pathname)) {
+  const isCostco = String(domain).toLowerCase().replace(/^www\./, '') === 'costco.com';
+  if (isCostco ? !pathname.replace(/\//g, '') : !PRODUCT_PATH.test(pathname)) {
     return 'URL does not contain product-page path evidence.';
   }
   if (!String(title || '').trim()) {
@@ -113,6 +114,7 @@ function normalized(value) {
 
 export function cleanRetailerSearchText(value) {
   return String(value || '')
+    .replace(/^[\s/\\|*#]+/, '')
     .replace(/[€£$]\s*\d[\d,]*(?:\.\d{1,2})?/g, ' ')
     .replace(/\b\d[\d,]*\.\d{1,2}\b(?!\s*(?:oz|ounce|ounces|lb|lbs|pound|pounds|g|kg|ml|l|liter|litre)\b)/gi, ' ')
     .replace(/\b(?:sales\s+tax|tax|subtotal|sub-total|total|price|prices|discount|disc|coupon|promo|markdown|savings|balance\s+due|amount\s+due|receipt|each|ea)\b/gi, ' ')
@@ -686,7 +688,7 @@ export async function searchRetailerWebsite({
       });
       if (isCostco && candidateLinks.length === 0) break;
 
-      const selectedCandidate = candidateLinks.find(candidate => {
+      const selectedCandidates = candidateLinks.filter(candidate => {
         const score = rankCandidate(candidate, product);
         const matchesKeywords = candidateMatchesProductKeywords(candidate, product);
         if (!matchesKeywords) {
@@ -703,7 +705,8 @@ export async function searchRetailerWebsite({
         }
         return matchesKeywords;
       });
-      if (selectedCandidate) {
+      if (selectedCandidates.length) {
+        const selectedCandidate = selectedCandidates[0];
         log({
           event: 'first_valid_product_selected',
           retailer,
@@ -714,7 +717,7 @@ export async function searchRetailerWebsite({
           candidateTitle: selectedCandidate.title,
           score: rankCandidate(selectedCandidate, product)
         });
-        return [selectedCandidate];
+        return selectedCandidates;
       }
 
       for (let pageNumber = 0; pageNumber < 3; pageNumber++) {
@@ -771,6 +774,36 @@ function parseVisiblePrice(text) {
   const values = [...new Set(matches.map(match => Number(match[1].replace(/,/g, ''))))]
     .filter(value => Number.isFinite(value) && value > 0);
   return values.length === 1 ? values[0] : null;
+}
+
+export function readCostcoWarehousePrice() {
+  const root = document.querySelector('main');
+  if (!root || !root.querySelector('h1')) return { found: false, price: null };
+  const amounts = [];
+  let found = false;
+  let ambiguous = false;
+  for (const label of root.querySelectorAll('*')) {
+    if (label.children.length || label.textContent.trim().toLowerCase() !== 'warehouse price') continue;
+    const style = window.getComputedStyle(label);
+    if (style.display === 'none' || style.visibility === 'hidden') continue;
+    found = true;
+    let container = label.parentElement;
+    for (let depth = 0; container && container !== root && depth < 3; depth++, container = container.parentElement) {
+      const text = (container.innerText || '').replace(/\s+/g, ' ').trim();
+      if (text.length > 200) break;
+      const values = [...text.matchAll(/\$\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2}))/g)];
+      if (!values.length) continue;
+      if (values.length !== 1 || /\b(?:save|savings|discount|off|per|each|unit|delivery|shipping|fee)\b/i.test(text)) {
+        ambiguous = true;
+        break;
+      }
+      const price = Number(values[0][1].replace(/,/g, ''));
+      if (Number.isFinite(price) && price > 0) amounts.push(price);
+      break;
+    }
+  }
+  const unique = [...new Set(amounts)];
+  return { found, price: !ambiguous && unique.length === 1 ? unique[0] : null };
 }
 
 export async function readRetailerProductPage(
@@ -854,10 +887,16 @@ export async function readRetailerProductPage(
       };
     });
     const visiblePrice = parseVisiblePrice(visibleData.priceTexts.join(' '));
+    const hostname = new URL(canonicalUrl).hostname.toLowerCase();
+    const warehouse = hostname === 'costco.com' || hostname.endsWith('.costco.com')
+      ? await page.evaluate(readCostcoWarehousePrice)
+      : { found: false, price: null };
     const visiblePriceVerified =
       String(visibleData.currency || '').toUpperCase() === 'USD' &&
       visiblePrice != null;
-    const finalPrice = visiblePriceVerified
+    const finalPrice = warehouse.found
+      ? warehouse.price
+      : visiblePriceVerified
       ? visiblePrice
       : pageData.verified
         ? pageData.price
@@ -889,9 +928,11 @@ export async function readRetailerProductPage(
       price: finalPrice,
       currency: finalPrice == null ? '' : 'USD',
       verified: finalPrice != null,
-      priceSource: visiblePriceVerified
+      priceSource: warehouse.found && warehouse.price != null
+        ? 'Costco warehouse price'
+        : !warehouse.found && visiblePriceVerified
         ? 'visible retailer price'
-        : pageData.priceSource
+        : !warehouse.found ? pageData.priceSource : null
     };
   } catch (error) {
     operationError = error;
